@@ -66,6 +66,7 @@ jobs:
           set -eux
 
           cp -a kwrt/devices openwrt/
+
           mkdir -p openwrt/package/kernel/linux/modules
           mkdir -p openwrt/package/network/utils/nftables/patches
           mkdir -p openwrt/package/libs/libnftnl/patches
@@ -74,6 +75,7 @@ jobs:
           mkdir -p openwrt/config
           mkdir -p openwrt/target/linux/generic/hack-6.12
           mkdir -p openwrt/target/linux/generic/pending-6.12
+
           mkdir -p "$GITHUB_WORKSPACE/source-files"
           : > "$GITHUB_WORKSPACE/source-files/extraction-manifest.txt"
 
@@ -91,79 +93,16 @@ jobs:
 
             if ! git -C "$repo" cat-file -e "$commit:$source" 2>/dev/null; then
               echo "ERROR: Source path does not exist: $source"
-              git -C "$repo" ls-tree -r --name-only "$commit" \
-                | grep -Fi "$(basename "$source")" || true
               return 1
             fi
 
             mkdir -p "$(dirname "$destination")"
+
             git -C "$repo" show "$commit:$source" > "$destination"
 
             printf '%s | %s | %s\n' \
               "$repo" "$commit" "$source" \
               >> "$GITHUB_WORKSPACE/source-files/extraction-manifest.txt"
-          }
-
-          extract_content_match() {
-            set +x
-
-            local repo="$1"
-            local commit="$2"
-            local directory="$3"
-            local keyword="$4"
-            local destination="$5"
-
-            local -a candidates=()
-            local -a matches=()
-            local path
-
-            echo "===== SEARCH PATCH CONTENT ====="
-            echo "Repository: $repo"
-            echo "Commit: $commit"
-            echo "Directory: $directory"
-            echo "Keyword: $keyword"
-
-            mapfile -t candidates < <(
-              git -C "$repo" ls-tree -r --name-only "$commit" -- "$directory" \
-                | grep -E '\.patch$' || true
-            )
-
-            echo "Patch files found: ${#candidates[@]}"
-
-            for path in "${candidates[@]}"; do
-              if git -C "$repo" show "$commit:$path" \
-                | grep -qiF -- "$keyword"; then
-                matches+=("$path")
-              fi
-            done
-
-            echo "Matching files: ${#matches[@]}"
-
-            if [ "${#matches[@]}" -ne 1 ]; then
-              echo "ERROR: Expected exactly one matching patch."
-              echo "Actual matches:"
-              printf '%s\n' "${matches[@]}"
-
-              echo "===== PATCH FILES IN DIRECTORY ====="
-              printf '%s\n' "${candidates[@]}"
-
-              set -x
-              return 1
-            fi
-
-            path="${matches[0]}"
-
-            echo "Matched source: $path"
-            echo "Destination: $destination"
-
-            mkdir -p "$(dirname "$destination")"
-            git -C "$repo" show "$commit:$path" > "$destination"
-
-            printf '%s | %s | %s\n' \
-              "$repo" "$commit" "$path" \
-              >> "$GITHUB_WORKSPACE/source-files/extraction-manifest.txt"
-
-            set -x
           }
 
           extract_exact \
@@ -172,26 +111,23 @@ jobs:
             package/kernel/linux/modules/video.mk \
             openwrt/package/kernel/linux/modules/video.mk
 
-          extract_content_match \
+          extract_exact \
             immortalwrt \
             "$IMMORTALWRT_COMMIT" \
-            package/network/utils/nftables \
-            fullcone \
-            openwrt/package/network/utils/nftables/patches/002-fullcone.patch
+            package/network/utils/nftables/patches/002-nftables-add-fullcone-expression-support.patch \
+            openwrt/package/network/utils/nftables/patches/002-nftables-add-fullcone-expression-support.patch
 
-          extract_content_match \
+          extract_exact \
             immortalwrt \
             "$IMMORTALWRT_COMMIT" \
-            package/libs/libnftnl \
-            fullcone \
-            openwrt/package/libs/libnftnl/patches/001-fullcone.patch
+            package/libs/libnftnl/patches/001-libnftnl-add-fullcone-expression-support.patch \
+            openwrt/package/libs/libnftnl/patches/001-libnftnl-add-fullcone-expression-support.patch
 
-          extract_content_match \
+          extract_exact \
             immortalwrt \
             "$IMMORTALWRT_COMMIT" \
-            package/firmware/wireless-regdb \
-            txpower \
-            openwrt/package/firmware/wireless-regdb/patches/600-custom.patch
+            package/firmware/wireless-regdb/patches/600-custom-change-txpower-and-dfs.patch \
+            openwrt/package/firmware/wireless-regdb/patches/600-custom-change-txpower-and-dfs.patch
 
           extract_exact \
             immortalwrt \
@@ -199,11 +135,10 @@ jobs:
             config/Config-kernel.in \
             openwrt/config/Config-kernel.in
 
-          extract_content_match \
+          extract_exact \
             lede \
             "$LEDE_COMMIT" \
-            package/system/fstools \
-            ntfs \
+            package/system/fstools/patches/0200-ntfs3-with-utf8.patch \
             openwrt/package/system/fstools/patches/0200-ntfs3-with-utf8.patch
 
           extract_exact \
@@ -301,7 +236,15 @@ jobs:
 
           chmod +x devices/common/diy.sh
 
-          echo "===== ORIGINAL DIY SCRIPT ====="
+          sed -i '\|wget -N .*package/kernel/linux/modules/video.mk|d' devices/common/diy.sh
+          sed -i '\|wget -N .*002-nftables-add-fullcone-expression-support.patch|d' devices/common/diy.sh
+          sed -i '\|wget -N .*001-libnftnl-add-fullcone-expression-support.patch|d' devices/common/diy.sh
+          sed -i '\|wget -N .*600-custom-change-txpower-and-dfs.patch|d' devices/common/diy.sh
+          sed -i '\|wget -N .*0200-ntfs3-with-utf8.patch|d' devices/common/diy.sh
+          sed -i '\|wget -N .*Config-kernel.in|d' devices/common/diy.sh
+          sed -i '\|wget -N .*613-netfilter_optional_tcp_window_check.patch|d' devices/common/diy.sh
+
+          echo "===== ORIGINAL DIY SCRIPT AFTER PINNED SOURCE ADJUSTMENT ====="
           cat devices/common/diy.sh
 
           echo "===== RUN HISTORICAL DIY SCRIPT ====="
@@ -315,24 +258,18 @@ jobs:
 
           bash devices/mediatek_filogic/diy.sh
 
-      - name: Update and install feeds
-        run: |
-          set -eux
-          cd openwrt
-
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a -p kiddin9 -f
-          ./scripts/feeds install -a
-
       - name: Reproduce Kwrt defconfig
+        shell: bash
         run: |
           set -eux
+
           cd openwrt
 
           make defconfig
 
           sed -n '/# Wireless Drivers/,/# end of Wireless Drivers/p' \
             .config | sed -e 's/=m/=n/' >> .config
+
           sed -i 's/\(kmod-qca.*\)=m/\1=n/' .config
 
           make defconfig
@@ -344,6 +281,7 @@ jobs:
             .config > "$GITHUB_WORKSPACE/kernel-config-summary.txt" || true
 
       - name: Record source and configuration details
+        shell: bash
         run: |
           set -eux
 
