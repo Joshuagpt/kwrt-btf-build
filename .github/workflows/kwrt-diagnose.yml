@@ -1,0 +1,135 @@
+name: Diagnose Kwrt Historical Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_date:
+        description: "Kwrt firmware build date (YYYY-MM-DD)"
+        required: true
+        default: "2026-03-30"
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git
+
+      - name: Clone Kwrt history
+        id: source
+        env:
+          BUILD_DATE: ${{ inputs.build_date }}
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$BUILD_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "Invalid date format"
+            exit 1
+          fi
+
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/kiddin9/Kwrt.git kwrt
+
+          cd kwrt
+          git remote set-head origin -a
+
+          COMMIT=$(git rev-list -1 \
+            --before="${BUILD_DATE} 23:59:59 +0000" \
+            origin/HEAD)
+
+          if [ -z "$COMMIT" ]; then
+            echo "No Kwrt commit found for requested date"
+            exit 1
+          fi
+
+          git checkout --detach "$COMMIT"
+
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+
+          echo "## Kwrt historical source" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Requested date: $BUILD_DATE" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Selected commit: $COMMIT" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Commit date:" >> "$GITHUB_STEP_SUMMARY"
+          git log -1 --format='%cI' >> "$GITHUB_STEP_SUMMARY"
+          echo "- Commit message:" >> "$GITHUB_STEP_SUMMARY"
+          git log -1 --format='%s' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect build configuration
+        env:
+          BUILD_DATE: ${{ inputs.build_date }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p snapshot/devices snapshot/workflows
+
+          cd kwrt
+
+          cp -a devices/common snapshot/devices/
+
+          if [ -d devices/mediatek_filogic ]; then
+            cp -a devices/mediatek_filogic snapshot/devices/
+          else
+            echo "ERROR: devices/mediatek_filogic not found"
+            exit 1
+          fi
+
+          if [ -f .github/workflows/Openwrt-AutoBuild.yml ]; then
+            cp .github/workflows/Openwrt-AutoBuild.yml \
+              ../snapshot/workflows/
+          fi
+
+          {
+            echo "Requested build date: $BUILD_DATE"
+            echo
+            echo "Kwrt commit:"
+            git log -1 --format='%H%n%cI%n%s'
+            echo
+            echo "Kwrt repository:"
+            git remote get-url origin
+            echo
+            echo "===== COMMON SETTINGS ====="
+            cat devices/common/settings.ini 2>/dev/null || true
+            echo
+            echo "===== MEDIATEK FILOGIC SETTINGS ====="
+            cat devices/mediatek_filogic/settings.ini 2>/dev/null || true
+            echo
+            echo "===== COMMON CONFIG FILES ====="
+            find devices/common -maxdepth 2 -type f \
+              \( -name '.config' -o -name '*.config' -o -name '*.ini' \) \
+              -print
+            echo
+            echo "===== TARGET CONFIG FILES ====="
+            find devices/mediatek_filogic -maxdepth 3 -type f \
+              \( -name '.config' -o -name '*.config' -o -name '*.ini' \) \
+              -print
+            echo
+            echo "===== WORKFLOW SOURCE SELECTION ====="
+            grep -nE 'REPO_URL|REPO_BRANCH|git clone|make defconfig|kernel.config' \
+              .github/workflows/Openwrt-AutoBuild.yml || true
+          } > ../snapshot/diagnosis.txt
+
+          cd ..
+
+          {
+            echo "===== SNAPSHOT FILE LIST ====="
+            find snapshot -type f | sort
+            echo
+            echo "===== SHA256 ====="
+            find snapshot -type f -print0 | sort -z | \
+              xargs -0 sha256sum
+          } > snapshot/manifest.txt
+
+          tar -czf kwrt-historical-config.tar.gz snapshot
+
+      - name: Upload diagnostic snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: kwrt-historical-config-${{ inputs.build_date }}
+          path: kwrt-historical-config.tar.gz
+          retention-days: 14
