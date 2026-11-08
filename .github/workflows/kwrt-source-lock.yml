@@ -20,156 +20,137 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y git curl jq python3
+          sudo apt-get install -y git
 
-      - name: Resolve historical source commits
+      - name: Resolve repository commits
         env:
           BUILD_DATE: ${{ inputs.build_date }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
           if ! [[ "$BUILD_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
-            echo "Invalid build date"
+            echo "Invalid date format"
             exit 1
           fi
 
-          UNTIL="${BUILD_DATE}T23:59:59+08:00"
+          UNTIL="${BUILD_DATE} 23:59:59 +0800"
 
           mkdir -p source-lock
 
-          resolve_commit() {
-            local repo="$1"
-            local branch="$2"
-            local path="$3"
+          resolve_repo() {
+            local name="$1"
+            local repo="$2"
+            local branch="$3"
+            local dir="repo-${name}"
 
-            local encoded_path
-            local encoded_until
-            local api_url
-            local response
-            local result
+            echo "===== Resolving ${repo} (${branch}) ====="
 
-            encoded_path=$(python3 -c \
-              'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' \
-              "$path")
+            git clone \
+              --filter=blob:none \
+              --no-checkout \
+              --single-branch \
+              --branch "$branch" \
+              "https://github.com/${repo}.git" \
+              "$dir"
 
-            encoded_until=$(python3 -c \
-              'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' \
-              "$UNTIL")
+            local commit
+            commit=$(git -C "$dir" rev-list \
+              -1 \
+              --before="$UNTIL" \
+              "refs/remotes/origin/${branch}")
 
-            api_url="https://api.github.com/repos/${repo}/commits?path=${encoded_path}&sha=${branch}&until=${encoded_until}&per_page=1"
-
-            response=$(curl -fsSL \
-              -H "Accept: application/vnd.github+json" \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              "$api_url")
-
-            result=$(echo "$response" | jq -r '
-              if length == 0 then
-                empty
-              else
-                .[0] |
-                [
-                  .sha,
-                  .commit.committer.date,
-                  (.commit.message | split("\n")[0])
-                ] | @tsv
-              end
-            ')
-
-            if [ -z "$result" ]; then
-              echo "ERROR: No historical commit found: ${repo} ${path}"
+            if [ -z "$commit" ]; then
+              echo "ERROR: No commit found for ${repo}"
               return 1
             fi
 
-            printf '%s\n' "$result"
+            git -C "$dir" checkout --detach "$commit"
+
+            local commit_date
+            local commit_message
+
+            commit_date=$(git -C "$dir" log -1 --format='%cI')
+            commit_message=$(git -C "$dir" log -1 --format='%s')
+
+            {
+              echo "Repository: ${repo}"
+              echo "Branch: ${branch}"
+              echo "Commit: ${commit}"
+              echo "Commit date: ${commit_date}"
+              echo "Commit message: ${commit_message}"
+              echo
+            } | tee -a source-lock/source-lock.txt
+
+            echo "${commit}" > "source-lock/${name}.commit"
           }
 
-          echo "===== OPENWRT BASE TAG =====" \
-            | tee source-lock/source-lock.txt
+          {
+            echo "KWRT HISTORICAL SOURCE LOCK"
+            echo "Build date: ${BUILD_DATE}"
+            echo "Cutoff: ${UNTIL}"
+            echo
+          } > source-lock/source-lock.txt
 
-          git ls-remote --tags \
+          echo "===== OpenWrt v25.12.2 ====="
+
+          OPENWRT_COMMIT=$(git ls-remote \
             https://github.com/openwrt/openwrt.git \
-            'refs/tags/v25.12.2*' \
-            | tee -a source-lock/source-lock.txt
+            'refs/tags/v25.12.2^{}' | awk '{print $1}')
 
-          echo >> source-lock/source-lock.txt
-          echo "===== KWRT ORIGINAL COMMIT =====" \
-            | tee -a source-lock/source-lock.txt
+          if [ -z "$OPENWRT_COMMIT" ]; then
+            OPENWRT_COMMIT=$(git ls-remote \
+              https://github.com/openwrt/openwrt.git \
+              'refs/tags/v25.12.2' | awk '{print $1}')
+          fi
 
-          echo "ab0b3066ed2152a1785fd7d4dba8a10b08b2e5c0" \
-            | tee -a source-lock/source-lock.txt
+          if [ -z "$OPENWRT_COMMIT" ]; then
+            echo "ERROR: Cannot resolve OpenWrt v25.12.2"
+            exit 1
+          fi
 
-          echo >> source-lock/source-lock.txt
-          echo "===== IMMORTALWRT HISTORICAL FILES =====" \
-            | tee -a source-lock/source-lock.txt
+          {
+            echo "Repository: openwrt/openwrt"
+            echo "Tag: v25.12.2"
+            echo "Commit: ${OPENWRT_COMMIT}"
+            echo
+          } | tee -a source-lock/source-lock.txt
 
-          IMMORTAL_PATHS=(
-            "package/kernel/linux/modules/video.mk"
-            "package/network/utils/nftables/patches/002-nftables-add-fullcone-expression-support.patch"
-            "package/libs/libnftnl/patches/001-libnftnl-add-fullcone-expression-support.patch"
-            "package/firmware/wireless-regdb/patches/600-custom-change-txpower-and-dfs.patch"
-            "config/Config-kernel.in"
-            "package/libs/openssl"
-            "package/network/services/ppp"
-          )
+          echo "$OPENWRT_COMMIT" \
+            > source-lock/openwrt.commit
 
-          for path in "${IMMORTAL_PATHS[@]}"; do
-            echo "Resolving ImmortalWrt: $path"
+          resolve_repo \
+            immortalwrt \
+            immortalwrt/immortalwrt \
+            openwrt-25.12
 
-            result=$(resolve_commit \
-              "immortalwrt/immortalwrt" \
-              "openwrt-25.12" \
-              "$path")
+          resolve_repo \
+            lede \
+            coolsnowwolf/lede \
+            master
 
-            printf 'immortalwrt/immortalwrt\t%s\t%s\n' \
-              "$path" "$result" \
-              | tee -a source-lock/source-lock.txt
-          done
+          {
+            echo "===== KWRT ORIGINAL SOURCE ====="
+            echo "Repository: kiddin9/Kwrt"
+            echo "Commit: ab0b3066ed2152a1785fd7d4dba8a10b08b2e5c0"
+            echo
+            echo "===== COMPLETED ====="
+          } | tee -a source-lock/source-lock.txt
 
-          echo >> source-lock/source-lock.txt
-          echo "===== LEDE HISTORICAL FILES =====" \
-            | tee -a source-lock/source-lock.txt
-
-          LEDE_PATHS=(
-            "target/linux/generic/hack-6.12"
-            "target/linux/generic/pending-6.12/613-netfilter_optional_tcp_window_check.patch"
-            "package/system/fstools/patches/0200-ntfs3-with-utf8.patch"
-          )
-
-          for path in "${LEDE_PATHS[@]}"; do
-            echo "Resolving LEDE: $path"
-
-            result=$(resolve_commit \
-              "coolsnowwolf/lede" \
-              "master" \
-              "$path")
-
-            printf 'coolsnowwolf/lede\t%s\t%s\n' \
-              "$path" "$result" \
-              | tee -a source-lock/source-lock.txt
-          done
-
-          echo >> source-lock/source-lock.txt
-          echo "===== COMPLETED =====" \
-            | tee -a source-lock/source-lock.txt
-
+          echo "===== FINAL SOURCE LOCK ====="
           cat source-lock/source-lock.txt
 
           {
-            echo "## Historical source resolution"
+            echo "## Historical source lock"
             echo
-            echo "- Build date: $BUILD_DATE"
-            echo "- Historical cutoff: $UNTIL"
-            echo "- OpenWrt base: v25.12.2"
-            echo "- Kwrt commit: ab0b3066ed2152a1785fd7d4dba8a10b08b2e5c0"
-            echo
-            echo "Source commit resolution completed."
+            echo "- Build date: ${BUILD_DATE}"
+            echo "- OpenWrt: ${OPENWRT_COMMIT}"
+            echo "- ImmortalWrt: $(cat source-lock/immortalwrt.commit)"
+            echo "- LEDE: $(cat source-lock/lede.commit)"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload source lock report
+      - name: Upload source lock
         uses: actions/upload-artifact@v4
         with:
           name: kwrt-source-lock-${{ inputs.build_date }}
-          path: source-lock/source-lock.txt
+          path: source-lock/
           retention-days: 30
