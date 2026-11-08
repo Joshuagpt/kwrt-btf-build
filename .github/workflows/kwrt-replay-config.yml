@@ -105,27 +105,17 @@ jobs:
           }
 
           extract_content_match() {
+            set +x
+
             local repo="$1"
             local commit="$2"
             local directory="$3"
             local keyword="$4"
             local destination="$5"
 
-            local matches=()
+            local -a candidates=()
+            local -a matches=()
             local path
-
-            while IFS= read -r path; do
-              case "$path" in
-                "$directory/"*.patch)
-                  if git -C "$repo" show "$commit:$path" \
-                    | grep -qiF -- "$keyword"; then
-                    matches+=("$path")
-                  fi
-                  ;;
-              esac
-            done < <(
-              git -C "$repo" ls-tree -r --name-only "$commit"
-            )
 
             echo "===== SEARCH PATCH CONTENT ====="
             echo "Repository: $repo"
@@ -133,28 +123,47 @@ jobs:
             echo "Directory: $directory"
             echo "Keyword: $keyword"
 
+            mapfile -t candidates < <(
+              git -C "$repo" ls-tree -r --name-only "$commit" -- "$directory" \
+                | grep -E '\.patch$' || true
+            )
+
+            echo "Patch files found: ${#candidates[@]}"
+
+            for path in "${candidates[@]}"; do
+              if git -C "$repo" show "$commit:$path" \
+                | grep -qiF -- "$keyword"; then
+                matches+=("$path")
+              fi
+            done
+
+            echo "Matching files: ${#matches[@]}"
+
             if [ "${#matches[@]}" -ne 1 ]; then
               echo "ERROR: Expected exactly one matching patch."
-              echo "Actual matches: ${#matches[@]}"
+              echo "Actual matches:"
               printf '%s\n' "${matches[@]}"
 
               echo "===== PATCH FILES IN DIRECTORY ====="
-              git -C "$repo" ls-tree -r --name-only "$commit" \
-                | while IFS= read -r candidate; do
-                    case "$candidate" in
-                      "$directory/"*.patch)
-                        echo "$candidate"
-                        ;;
-                    esac
-                  done
+              printf '%s\n' "${candidates[@]}"
 
+              set -x
               return 1
             fi
 
-            printf 'Matched source: %s\n' "${matches[0]}"
+            path="${matches[0]}"
 
-            extract_exact "$repo" "$commit" \
-              "${matches[0]}" "$destination"
+            echo "Matched source: $path"
+            echo "Destination: $destination"
+
+            mkdir -p "$(dirname "$destination")"
+            git -C "$repo" show "$commit:$path" > "$destination"
+
+            printf '%s | %s | %s\n' \
+              "$repo" "$commit" "$path" \
+              >> "$GITHUB_WORKSPACE/source-files/extraction-manifest.txt"
+
+            set -x
           }
 
           extract_exact \
