@@ -1,3 +1,4 @@
+
 name: Diagnose Kwrt Historical Build
 
 on:
@@ -38,7 +39,6 @@ jobs:
 
           cd kwrt
           git remote set-head origin -a
-
           COMMIT=$(git rev-list -1 \
             --before="${BUILD_DATE} 23:59:59 +0000" \
             origin/HEAD)
@@ -51,7 +51,6 @@ jobs:
           git checkout --detach "$COMMIT"
 
           echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
-
           echo "## Kwrt historical source" >> "$GITHUB_STEP_SUMMARY"
           echo "- Requested date: $BUILD_DATE" >> "$GITHUB_STEP_SUMMARY"
           echo "- Selected commit: $COMMIT" >> "$GITHUB_STEP_SUMMARY"
@@ -70,10 +69,10 @@ jobs:
 
           cd kwrt
 
-          cp -a devices/common snapshot/devices/
+          cp -a devices/common ../snapshot/devices/
 
           if [ -d devices/mediatek_filogic ]; then
-            cp -a devices/mediatek_filogic snapshot/devices/
+            cp -a devices/mediatek_filogic ../snapshot/devices/
           else
             echo "ERROR: devices/mediatek_filogic not found"
             exit 1
