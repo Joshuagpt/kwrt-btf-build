@@ -111,23 +111,18 @@ jobs:
             package/kernel/linux/modules/video.mk \
             openwrt/package/kernel/linux/modules/video.mk
 
-          extract_exact \
-            immortalwrt \
-            "$IMMORTALWRT_COMMIT" \
-            package/network/utils/nftables/patches/002-nftables-add-fullcone-expression-support.patch \
-            openwrt/package/network/utils/nftables/patches/002-nftables-add-fullcone-expression-support.patch
-
-          extract_exact \
-            immortalwrt \
-            "$IMMORTALWRT_COMMIT" \
-            package/libs/libnftnl/patches/001-libnftnl-add-fullcone-expression-support.patch \
-            openwrt/package/libs/libnftnl/patches/001-libnftnl-add-fullcone-expression-support.patch
-
-          extract_exact \
-            immortalwrt \
-            "$IMMORTALWRT_COMMIT" \
-            package/firmware/wireless-regdb/patches/600-custom-change-txpower-and-dfs.patch \
-            openwrt/package/firmware/wireless-regdb/patches/600-custom-change-txpower-and-dfs.patch
+          # The following files do NOT exist at IMMORTALWRT_COMMIT
+          # (8a18e84a887379db8954449a9fabe6df54084dea, 2026-03-30):
+          #   - package/network/utils/nftables/patches/002-nftables-add-fullcone-expression-support.patch
+          #   - package/libs/libnftnl/patches/001-libnftnl-add-fullcone-expression-support.patch
+          #   - package/firmware/wireless-regdb/patches/600-custom-change-txpower-and-dfs.patch
+          # They are userspace / wireless-regdb only and are not required for
+          # producing a kernel-matched detached BTF. diy.sh wget lines for them
+          # are already stripped below, so skipping extract is safe.
+          #
+          # extract_exact immortalwrt ... 002-nftables-add-fullcone-expression-support.patch ...
+          # extract_exact immortalwrt ... 001-libnftnl-add-fullcone-expression-support.patch ...
+          # extract_exact immortalwrt ... 600-custom-change-txpower-and-dfs.patch ...
 
           extract_exact \
             immortalwrt \
