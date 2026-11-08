@@ -62,10 +62,29 @@ jobs:
             rsync swig unzip zlib1g-dev file wget \
             llvm python3-pyelftools libpython3-dev \
             aria2 jq libelf-dev device-tree-compiler \
-            libgmp-dev libmpc-dev dwarves bpftool
+            libgmp-dev libmpc-dev dwarves \
+            linux-tools-common linux-tools-generic
+
+          # Ubuntu 24.04: "bpftool" is a virtual package. The real binary
+          # lives under linux-tools-*; the wrapper in linux-tools-common
+          # looks up /usr/lib/linux-tools/$(uname -r)/bpftool. On GHA the
+          # running kernel tools package may be missing — fall back to any
+          # installed bpftool binary.
+          KREL="$(uname -r)"
+          if ! command -v bpftool >/dev/null 2>&1 || ! bpftool version >/dev/null 2>&1; then
+            sudo apt-get install -y --no-install-recommends \
+              "linux-tools-${KREL}" || true
+            if ! bpftool version >/dev/null 2>&1; then
+              FALLBACK="$(find /usr/lib -type f -name bpftool -perm -111 2>/dev/null | sort -V | tail -n 1 || true)"
+              if [ -n "$FALLBACK" ]; then
+                sudo mkdir -p "/usr/lib/linux-tools/${KREL}"
+                sudo ln -sfn "$FALLBACK" "/usr/lib/linux-tools/${KREL}/bpftool"
+              fi
+            fi
+          fi
 
           pahole --version
-          bpftool version || true
+          bpftool version || echo "WARN: bpftool unavailable; BTF gate will use pahole-only checks"
 
       - name: Checkout pinned source repositories
         run: |
