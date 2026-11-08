@@ -76,8 +76,9 @@ jobs:
           mkdir -p openwrt/config
           mkdir -p openwrt/target/linux/generic/hack-6.12
           mkdir -p openwrt/target/linux/generic/pending-6.12
-
           mkdir -p "$GITHUB_WORKSPACE/source-files"
+
+          : > "$GITHUB_WORKSPACE/source-files/extraction-manifest.txt"
 
           extract_exact() {
             local repo="$1"
@@ -121,20 +122,21 @@ jobs:
 
             echo "===== SEARCH SOURCE ====="
             echo "Repository: $repo"
+            echo "Commit: $commit"
             echo "Pattern: $pattern"
-            printf '%s\n' "${matches[@]}"
 
             if [ "${#matches[@]}" -ne 1 ]; then
               echo "ERROR: Expected exactly one matching source file."
               echo "Actual matches: ${#matches[@]}"
+              printf '%s\n' "${matches[@]}"
               return 1
             fi
+
+            printf 'Matched source: %s\n' "${matches[0]}"
 
             extract_exact "$repo" "$commit" \
               "${matches[0]}" "$destination"
           }
-
-          : > "$GITHUB_WORKSPACE/source-files/extraction-manifest.txt"
 
           extract_exact \
             immortalwrt \
@@ -177,6 +179,8 @@ jobs:
             "$LEDE_COMMIT" \
             target/linux/generic/pending-6.12/613-netfilter_optional_tcp_window_check.patch \
             openwrt/target/linux/generic/pending-6.12/613-netfilter_optional_tcp_window_check.patch
+
+          echo "===== EXTRACT LEDE HACK-6.12 ====="
 
           git -C lede archive "$LEDE_COMMIT" \
             target/linux/generic/hack-6.12 \
@@ -233,9 +237,9 @@ jobs:
 
             for path in "$@"; do
               echo "===== PINNED COPY ====="
-              echo "$repo"
-              echo "$commit"
-              echo "$path"
+              echo "Repository: $repo"
+              echo "Commit: $commit"
+              echo "Path: $path"
 
               git -C "$repo" cat-file -e "$commit:$path"
 
