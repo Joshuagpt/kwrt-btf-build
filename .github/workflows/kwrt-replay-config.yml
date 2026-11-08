@@ -1,0 +1,282 @@
+
+name: Reproduce Historical Kwrt Config
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_date:
+        description: "Historical Kwrt build date"
+        required: true
+        default: "2026-03-30"
+
+permissions:
+  contents: read
+
+jobs:
+  replay:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    env:
+      TZ: Asia/Shanghai
+      BUILD_DATE: ${{ inputs.build_date }}
+      KWRT_COMMIT: ab0b3066ed2152a1785fd7d4dba8a10b08b2e5c0
+      OPENWRT_COMMIT: d266501ad6188cce279a487b1ce61f4f327cd496
+      IMMORTALWRT_COMMIT: 8a18e84a887379db8954449a9fabe6df54084dea
+      LEDE_COMMIT: 7b303a8ddacdd798c1cdef0ef4f015fa50597390
+
+    steps:
+      - name: Checkout build repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git \
+            libncurses-dev libssl-dev python3-setuptools \
+            rsync swig unzip zlib1g-dev file wget \
+            llvm python3-pyelftools libpython3-dev \
+            aria2 jq libelf-dev device-tree-compiler \
+            libgmp-dev libmpc-dev
+
+      - name: Checkout pinned source repositories
+        run: |
+          set -eux
+
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/openwrt/openwrt.git openwrt
+
+          git -C openwrt checkout "$OPENWRT_COMMIT"
+
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/immortalwrt/immortalwrt.git immortalwrt
+
+          git -C immortalwrt checkout "$IMMORTALWRT_COMMIT"
+
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/coolsnowwolf/lede.git lede
+
+          git -C lede checkout "$LEDE_COMMIT"
+
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/kiddin9/Kwrt.git kwrt
+
+          git -C kwrt checkout "$KWRT_COMMIT"
+
+      - name: Restore historical Kwrt configuration
+        run: |
+          set -eux
+
+          cp -a kwrt/devices openwrt/
+
+          mkdir -p openwrt/package/kernel/linux/modules
+          mkdir -p openwrt/package/network/utils/nftables/patches
+          mkdir -p openwrt/package/libs/libnftnl/patches
+          mkdir -p openwrt/package/firmware/wireless-regdb/patches
+          mkdir -p openwrt/package/system/fstools/patches
+          mkdir -p openwrt/config
+
+          git -C immortalwrt show \
+            "$IMMORTALWRT_COMMIT:package/kernel/linux/modules/video.mk" \
+            > openwrt/package/kernel/linux/modules/video.mk
+
+          git -C immortalwrt show \
+            "$IMMORTALWRT_COMMIT:package/network/utils/nftables/patches/002-nftables-add-fullcone-expression-support.patch" \
+            > openwrt/package/network/utils/nftables/patches/002-nftables-add-fullcone-expression-support.patch
+
+          git -C immortalwrt show \
+            "$IMMORTALWRT_COMMIT:package/libs/libnftnl/patches/001-libnftnl-add-fullcone-expression-support.patch" \
+            > openwrt/package/libs/libnftnl/patches/001-libnftnl-add-fullcone-expression-support.patch
+
+          git -C immortalwrt show \
+            "$IMMORTALWRT_COMMIT:package/firmware/wireless-regdb/patches/600-custom-change-txpower-and-dfs.patch" \
+            > openwrt/package/firmware/wireless-regdb/patches/600-custom-change-txpower-and-dfs.patch
+
+          git -C immortalwrt show \
+            "$IMMORTALWRT_COMMIT:config/Config-kernel.in" \
+            > openwrt/config/Config-kernel.in
+
+          git -C lede show \
+            "$LEDE_COMMIT:package/system/fstools/patches/0200-ntfs3-with-utf8.patch" \
+            > openwrt/package/system/fstools/patches/0200-ntfs3-with-utf8.patch
+
+          git -C lede show \
+            "$LEDE_COMMIT:target/linux/generic/pending-6.12/613-netfilter_optional_tcp_window_check.patch" \
+            > openwrt/target/linux/generic/pending-6.12/613-netfilter_optional_tcp_window_check.patch
+
+          mkdir -p openwrt/target/linux/generic/hack-6.12
+
+          git -C lede archive "$LEDE_COMMIT" \
+            target/linux/generic/hack-6.12 \
+            | tar -x -C openwrt
+
+      - name: Prepare historical DIY environment
+        run: |
+          set -eux
+
+          cd openwrt
+
+          export PIN_IMMORTALWRT="$GITHUB_WORKSPACE/immortalwrt"
+          export PIN_LEDE="$GITHUB_WORKSPACE/lede"
+          export PIN_IMMORTALWRT_COMMIT="$IMMORTALWRT_COMMIT"
+          export PIN_LEDE_COMMIT="$LEDE_COMMIT"
+
+          git_clone_path() {
+            local branch="$1"
+            local url="$2"
+            shift 2
+
+            local move_mode="false"
+
+            if [ "${1:-}" = "mv" ]; then
+              move_mode="true"
+              shift
+            fi
+
+            local repo=""
+            local commit=""
+
+            case "$url" in
+              *immortalwrt*)
+                repo="$PIN_IMMORTALWRT"
+                commit="$PIN_IMMORTALWRT_COMMIT"
+                ;;
+              *coolsnowwolf/lede*)
+                repo="$PIN_LEDE"
+                commit="$PIN_LEDE_COMMIT"
+                ;;
+              *)
+                echo "Unpinned repository: $url"
+                return 1
+                ;;
+            esac
+
+            local root="$PWD"
+            local temp
+            temp="$(mktemp -d)"
+
+            for path in "$@"; do
+              mkdir -p "$temp/$(dirname "$path")"
+              git -C "$repo" archive "$commit" "$path" \
+                | tar -x -C "$temp"
+            done
+
+            for path in "$@"; do
+              mkdir -p "$root/$(dirname "$path")"
+
+              if [ "$move_mode" = "true" ]; then
+                mkdir -p "$root/$path"
+                if [ -d "$temp/$path" ]; then
+                  cp -an "$temp/$path/." "$root/$path/"
+                fi
+              else
+                if [ -e "$temp/$path" ]; then
+                  mkdir -p "$root/$(dirname "$path")"
+                  cp -an "$temp/$path" "$root/$path"
+                fi
+              fi
+            done
+
+            rm -rf "$temp"
+          }
+
+          export -f git_clone_path
+
+          chmod +x devices/common/diy.sh
+
+          sed -i '/wget -N .*immortalwrt\/immortalwrt\/raw/d' \
+            devices/common/diy.sh
+
+          sed -i '/wget -N .*coolsnowwolf\/lede\/raw/d' \
+            devices/common/diy.sh
+
+          sed -i '/wget -N .*openwrt\/packages\/master/d' \
+            devices/common/diy.sh
+
+          sed -i '/status=$(curl /d' devices/common/diy.sh
+          sed -i '/while \[\[ "\$status"/d' devices/common/diy.sh
+          sed -i '/echo "wait 5s"/d' devices/common/diy.sh
+          sed -i '/sleep 5/d' devices/common/diy.sh
+
+          bash devices/common/diy.sh
+
+          cp -f devices/common/.config .config
+
+          if [ -f devices/mediatek_filogic/.config ]; then
+            cat devices/mediatek_filogic/.config >> .config
+          fi
+
+          bash devices/mediatek_filogic/diy.sh
+
+      - name: Update and install feeds
+        run: |
+          set -eux
+          cd openwrt
+
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a -p kiddin9 -f
+          ./scripts/feeds install -a
+
+      - name: Reproduce Kwrt defconfig
+        run: |
+          set -eux
+          cd openwrt
+
+          make defconfig
+
+          sed -n '/# Wireless Drivers/,/# end of Wireless Drivers/p' \
+            .config | sed -e 's/=m/=n/' >> .config
+
+          sed -i 's/\(kmod-qca.*\)=m/\1=n/' .config
+
+          make defconfig
+
+          cp .config "$GITHUB_WORKSPACE/kwrt-final.config"
+
+          grep -E \
+            '^(CONFIG_TARGET_|CONFIG_LINUX_|CONFIG_KERNEL_|CONFIG_PACKAGE_kmod-veth|CONFIG_PACKAGE_kmod-sched-core|CONFIG_PACKAGE_kmod-sched-bpf)' \
+            .config > "$GITHUB_WORKSPACE/kernel-config-summary.txt" || true
+
+      - name: Record source and configuration details
+        run: |
+          set -eux
+
+          {
+            echo "Historical build date: $BUILD_DATE"
+            echo
+            echo "Kwrt commit:"
+            git -C kwrt rev-parse HEAD
+            echo
+            echo "OpenWrt commit:"
+            git -C openwrt rev-parse HEAD
+            echo
+            echo "ImmortalWrt commit:"
+            git -C immortalwrt rev-parse HEAD
+            echo
+            echo "LEDE commit:"
+            git -C lede rev-parse HEAD
+            echo
+            echo "OpenWrt kernel version:"
+            grep -E '^(LINUX_VERSION|LINUX_KERNEL_HASH)' \
+              openwrt/include/kernel-version.mk || true
+            echo
+            echo "Target configuration:"
+            grep -E '^(CONFIG_TARGET_|CONFIG_LINUX_|CONFIG_KERNEL_)' \
+              openwrt/.config || true
+            echo
+            echo "Config SHA256:"
+            sha256sum openwrt/.config
+          } > "$GITHUB_WORKSPACE/replay-report.txt"
+
+      - name: Upload replay results
+        uses: actions/upload-artifact@v4
+        with:
+          name: kwrt-replay-config-${{ inputs.build_date }}
+          path: |
+            kwrt-final.config
+            kernel-config-summary.txt
+            replay-report.txt
+          if-no-files-found: error
+          retention-days: 30
