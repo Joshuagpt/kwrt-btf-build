@@ -355,11 +355,28 @@ jobs:
           set -eux
           cd openwrt
 
-          # Download only what is needed; build toolchain + kernel prepare + package
+          # Prefetch sources (kernel tarball, toolchain) so failures are clearer
+          make -j$(nproc) download || make -j1 download V=s
+
           make -j$(nproc) tools/install
-          make -j$(nproc) toolchain/install
-          make -j$(nproc) target/linux/prepare
-          # Ensure autoconf.h / generated headers exist
+
+          # toolchain/kernel-headers is the fragile step — capture verbose log on failure
+          if ! make -j$(nproc) toolchain/install; then
+            echo "===== toolchain/install failed; re-running kernel-headers with V=s ====="
+            make -j1 V=s toolchain/kernel-headers/compile 2>&1 | tee "$GITHUB_WORKSPACE/kernel-headers-fail.log" || true
+            make -j1 V=s toolchain/install 2>&1 | tee -a "$GITHUB_WORKSPACE/kernel-headers-fail.log" || true
+            echo "===== last 200 lines of verbose log ====="
+            tail -n 200 "$GITHUB_WORKSPACE/kernel-headers-fail.log" || true
+            exit 1
+          fi
+
+          if ! make -j$(nproc) target/linux/prepare; then
+            echo "===== target/linux/prepare failed; verbose retry ====="
+            make -j1 V=s target/linux/prepare 2>&1 | tee "$GITHUB_WORKSPACE/linux-prepare-fail.log"
+            exit 1
+          fi
+
+          # Headers / modules build — needed so LINUX_DIR has generated autoconf.h
           make -j$(nproc) target/linux/compile || make -j$(nproc) target/linux/install || true
 
           # Package build (produces IPK under bin/packages/... or bin/targets/...)
@@ -479,3 +496,16 @@ jobs:
             btf-package-paths.txt
           if-no-files-found: error
           retention-days: 30
+
+      - name: Upload failure logs (if any)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kwrt-btf-build-failure-logs
+          path: |
+            kernel-headers-fail.log
+            linux-prepare-fail.log
+            kwrt-btf.config
+            source-files/extraction-manifest.txt
+          if-no-files-found: ignore
+          retention-days: 14
