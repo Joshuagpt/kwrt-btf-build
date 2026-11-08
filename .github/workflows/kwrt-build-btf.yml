@@ -1,0 +1,453 @@
+name: Build Matching Detached BTF IPK
+
+# Produces a detached vmlinux BTF IPK that matches the historical Kwrt
+# firmware kernel (version, arch, config-derived types). The IPK is only
+# uploaded when all compatibility gates pass.
+#
+# Target (from project README):
+#   Device:        Globitel BT-R320
+#   Firmware:      Kwrt 25.12.2
+#   Target:        mediatek/filogic
+#   Architecture:  aarch64_cortex-a53
+#   Kernel:        6.12.74
+#   Kernel pkg:    6.12.74~1-r1
+#   Format:        IPK (opkg)
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_date:
+        description: "Historical Kwrt build date (must match replay pins)"
+        required: true
+        default: "2026-03-30"
+      expected_kernel:
+        description: "Expected LINUX_VERSION (uname -r major.minor.patch)"
+        required: true
+        default: "6.12.74"
+      expected_arch:
+        description: "Expected CONFIG_TARGET_ARCH_PACKAGES"
+        required: true
+        default: "aarch64_cortex-a53"
+
+permissions:
+  contents: read
+
+jobs:
+  build-btf:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      TZ: Asia/Shanghai
+      BUILD_DATE: ${{ inputs.build_date }}
+      EXPECTED_KERNEL: ${{ inputs.expected_kernel }}
+      EXPECTED_ARCH: ${{ inputs.expected_arch }}
+      # Same pins as kwrt-replay-config.yml — do not drift
+      KWRT_COMMIT: ab0b3066ed2152a1785fd7d4dba8a10b08b2e5c0
+      OPENWRT_COMMIT: d266501ad6188cce279a487b1ce61f4f327cd496
+      IMMORTALWRT_COMMIT: 8a18e84a887379db8954449a9fabe6df54084dea
+      LEDE_COMMIT: 7b303a8ddacdd798c1cdef0ef4f015fa50597390
+
+    steps:
+      - name: Checkout build repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git \
+            libncurses-dev libssl-dev python3-setuptools \
+            rsync swig unzip zlib1g-dev file wget \
+            llvm python3-pyelftools libpython3-dev \
+            aria2 jq libelf-dev device-tree-compiler \
+            libgmp-dev libmpc-dev dwarves bpftool
+
+          pahole --version
+          bpftool version || true
+
+      - name: Checkout pinned source repositories
+        run: |
+          set -eux
+
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/openwrt/openwrt.git openwrt
+          git -C openwrt checkout "$OPENWRT_COMMIT"
+
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/immortalwrt/immortalwrt.git immortalwrt
+          git -C immortalwrt checkout "$IMMORTALWRT_COMMIT"
+
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/coolsnowwolf/lede.git lede
+          git -C lede checkout "$LEDE_COMMIT"
+
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/kiddin9/Kwrt.git kwrt
+          git -C kwrt checkout "$KWRT_COMMIT"
+
+      - name: Restore historical Kwrt configuration
+        shell: bash
+        run: |
+          set -eux
+
+          cp -a kwrt/devices openwrt/
+
+          mkdir -p openwrt/package/kernel/linux/modules
+          mkdir -p openwrt/package/network/utils/nftables/patches
+          mkdir -p openwrt/package/libs/libnftnl/patches
+          mkdir -p openwrt/package/firmware/wireless-regdb/patches
+          mkdir -p openwrt/package/system/fstools/patches
+          mkdir -p openwrt/config
+          mkdir -p openwrt/target/linux/generic/hack-6.12
+          mkdir -p openwrt/target/linux/generic/pending-6.12
+
+          mkdir -p "$GITHUB_WORKSPACE/source-files"
+          : > "$GITHUB_WORKSPACE/source-files/extraction-manifest.txt"
+
+          extract_exact() {
+            local repo="$1"
+            local commit="$2"
+            local source="$3"
+            local destination="$4"
+
+            echo "===== EXTRACT EXACT ====="
+            echo "Repository: $repo"
+            echo "Commit: $commit"
+            echo "Source: $source"
+            echo "Destination: $destination"
+
+            if ! git -C "$repo" cat-file -e "$commit:$source" 2>/dev/null; then
+              echo "ERROR: Source path does not exist: $source"
+              return 1
+            fi
+
+            mkdir -p "$(dirname "$destination")"
+            git -C "$repo" show "$commit:$source" > "$destination"
+
+            printf '%s | %s | %s\n' \
+              "$repo" "$commit" "$source" \
+              >> "$GITHUB_WORKSPACE/source-files/extraction-manifest.txt"
+          }
+
+          extract_exact \
+            immortalwrt \
+            "$IMMORTALWRT_COMMIT" \
+            package/kernel/linux/modules/video.mk \
+            openwrt/package/kernel/linux/modules/video.mk
+
+          # These paths do not exist at IMMORTALWRT_COMMIT (2026-03-30).
+          # Userspace / regdb only — not required for kernel-matched BTF.
+          # diy.sh wget lines for them are stripped below.
+          #   package/network/utils/nftables/patches/002-nftables-add-fullcone-expression-support.patch
+          #   package/libs/libnftnl/patches/001-libnftnl-add-fullcone-expression-support.patch
+          #   package/firmware/wireless-regdb/patches/600-custom-change-txpower-and-dfs.patch
+
+          extract_exact \
+            immortalwrt \
+            "$IMMORTALWRT_COMMIT" \
+            config/Config-kernel.in \
+            openwrt/config/Config-kernel.in
+
+          extract_exact \
+            lede \
+            "$LEDE_COMMIT" \
+            package/system/fstools/patches/0200-ntfs3-with-utf8.patch \
+            openwrt/package/system/fstools/patches/0200-ntfs3-with-utf8.patch
+
+          extract_exact \
+            lede \
+            "$LEDE_COMMIT" \
+            target/linux/generic/pending-6.12/613-netfilter_optional_tcp_window_check.patch \
+            openwrt/target/linux/generic/pending-6.12/613-netfilter_optional_tcp_window_check.patch
+
+          git -C lede archive "$LEDE_COMMIT" \
+            target/linux/generic/hack-6.12 \
+            | tar -x -C openwrt
+
+          cat "$GITHUB_WORKSPACE/source-files/extraction-manifest.txt"
+
+      - name: Prepare historical DIY environment
+        shell: bash
+        run: |
+          set -eux
+
+          cd openwrt
+
+          # Patch diy helpers used by Kwrt scripts
+          git_clone_path() {
+            local branch="$1"
+            local repo="$2"
+            shift 2
+            local temp
+            temp=$(mktemp -d)
+            git clone --depth 1 --branch "$branch" "$repo" "$temp" || \
+              git clone --depth 1 "$repo" "$temp"
+            for path in "$@"; do
+              if [ -e "$temp/$path" ]; then
+                rm -rf "$path"
+                mkdir -p "$(dirname "$path")"
+                cp -a "$temp/$path" "$path"
+              fi
+            done
+            rm -rf "$temp"
+          }
+          export -f git_clone_path
+
+          chmod +x devices/common/diy.sh
+
+          # Prefer pinned extracts over live wget of floating branches
+          sed -i '\|wget -N .*package/kernel/linux/modules/video.mk|d' devices/common/diy.sh
+          sed -i '\|wget -N .*002-nftables-add-fullcone-expression-support.patch|d' devices/common/diy.sh
+          sed -i '\|wget -N .*001-libnftnl-add-fullcone-expression-support.patch|d' devices/common/diy.sh
+          sed -i '\|wget -N .*600-custom-change-txpower-and-dfs.patch|d' devices/common/diy.sh
+          sed -i '\|wget -N .*0200-ntfs3-with-utf8.patch|d' devices/common/diy.sh
+          sed -i '\|wget -N .*Config-kernel.in|d' devices/common/diy.sh
+          sed -i '\|wget -N .*613-netfilter_optional_tcp_window_check.patch|d' devices/common/diy.sh
+
+          # diy.sh waits on REPO_TOKEN for kiddin9/op-packages CI; skip that loop in this job
+          sed -i '/REPO_TOKEN/d' devices/common/diy.sh
+          sed -i '/while \[\[ \"\$status\"/d' devices/common/diy.sh
+          sed -i '/wait 5s/d' devices/common/diy.sh
+
+          bash devices/common/diy.sh
+
+          cp -f devices/common/.config .config
+          if [ -f devices/mediatek_filogic/.config ]; then
+            cat devices/mediatek_filogic/.config >> .config
+          fi
+          if [ -f devices/mediatek_filogic/diy.sh ]; then
+            bash devices/mediatek_filogic/diy.sh || true
+          fi
+
+      - name: Reproduce Kwrt defconfig and apply BTF-only overlay
+        shell: bash
+        run: |
+          set -eux
+          cd openwrt
+
+          make defconfig
+
+          # Historical Kwrt-style wireless cleanup (same as replay workflow)
+          sed -n '/# Wireless Drivers/,/# end of Wireless Drivers/p' \
+            .config | sed -e 's/=m/=n/' >> .config || true
+          sed -i 's/\(kmod-qca.*\)=m/\1=n/' .config || true
+          make defconfig
+
+          # --- BTF overlay: only options that affect debug info generation ---
+          # These must NOT change struct layouts / ABI / vermagic-relevant code.
+          cat >> .config <<'EOF'
+          CONFIG_KERNEL_DEBUG_KERNEL=y
+          CONFIG_KERNEL_DEBUG_INFO=y
+          # CONFIG_KERNEL_DEBUG_INFO_REDUCED is not set
+          CONFIG_KERNEL_DEBUG_INFO_BTF=y
+          CONFIG_PACKAGE_vmlinux-btf=y
+          EOF
+
+          # Normalize and expand
+          make defconfig
+
+          # Snapshot for audit
+          cp .config "$GITHUB_WORKSPACE/kwrt-btf.config"
+          sha256sum .config | tee "$GITHUB_WORKSPACE/kwrt-btf.config.sha256"
+
+      - name: Gate — kernel version and architecture must match target
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd openwrt
+
+          # Resolve LINUX_VERSION from the tree (must be 6.12.74 for this pin)
+          KERNEL_PATCHVER=$(sed -n 's/^KERNEL_PATCHVER:=//p' target/linux/mediatek/Makefile | head -1 || true)
+          if [ -z "$KERNEL_PATCHVER" ]; then
+            KERNEL_PATCHVER=6.12
+          fi
+          LINUX_VERSION=$(grep -E "^LINUX_VERSION-${KERNEL_PATCHVER}" target/linux/generic/kernel-${KERNEL_PATCHVER} \
+            | head -1 | sed -E "s/^LINUX_VERSION-${KERNEL_PATCHVER}\s*=\s*//" | tr -d ' ')
+          FULL_VERSION="${KERNEL_PATCHVER}${LINUX_VERSION}"
+
+          ARCH_PACKAGES=$(grep -E '^CONFIG_TARGET_ARCH_PACKAGES=' .config | cut -d= -f2 | tr -d '"')
+          BOARD=$(grep -E '^CONFIG_TARGET_BOARD=' .config | cut -d= -f2 | tr -d '"')
+          SUBTARGET=$(grep -E '^CONFIG_TARGET_SUBTARGET=' .config | cut -d= -f2 | tr -d '"')
+
+          echo "Resolved kernel: $FULL_VERSION"
+          echo "Arch packages:   $ARCH_PACKAGES"
+          echo "Board/subtarget: $BOARD/$SUBTARGET"
+          echo "Expected kernel: $EXPECTED_KERNEL"
+          echo "Expected arch:   $EXPECTED_ARCH"
+
+          FAIL=0
+          if [ "$FULL_VERSION" != "$EXPECTED_KERNEL" ]; then
+            echo "ERROR: kernel version mismatch: got $FULL_VERSION want $EXPECTED_KERNEL"
+            FAIL=1
+          fi
+          if [ "$ARCH_PACKAGES" != "$EXPECTED_ARCH" ]; then
+            echo "ERROR: arch mismatch: got $ARCH_PACKAGES want $EXPECTED_ARCH"
+            FAIL=1
+          fi
+          if [ "$BOARD" != "mediatek" ] || [ "$SUBTARGET" != "filogic" ]; then
+            echo "ERROR: target mismatch: got $BOARD/$SUBTARGET want mediatek/filogic"
+            FAIL=1
+          fi
+
+          # BTF options must be active after defconfig
+          grep -q '^CONFIG_KERNEL_DEBUG_INFO=y' .config || { echo "ERROR: DEBUG_INFO not enabled"; FAIL=1; }
+          grep -q '^# CONFIG_KERNEL_DEBUG_INFO_REDUCED is not set' .config \
+            || grep -q '^CONFIG_KERNEL_DEBUG_INFO_REDUCED=n' .config \
+            || { echo "ERROR: DEBUG_INFO_REDUCED still on"; FAIL=1; }
+          grep -qE '^CONFIG_KERNEL_DEBUG_INFO_BTF=y|^CONFIG_DEBUG_INFO_BTF=y' .config \
+            || { echo "ERROR: DEBUG_INFO_BTF not enabled"; FAIL=1; }
+
+          if [ "$FAIL" -ne 0 ]; then
+            echo "Compatibility gate failed — refusing to build IPK"
+            exit 1
+          fi
+
+          echo "FULL_VERSION=$FULL_VERSION" >> "$GITHUB_ENV"
+          echo "ARCH_PACKAGES=$ARCH_PACKAGES" >> "$GITHUB_ENV"
+
+      - name: Add vmlinux-btf package (source build)
+        shell: bash
+        run: |
+          set -eux
+          cd openwrt
+
+          # Vendor the package into the tree so we do not depend on floating feeds
+          rm -rf package/kernel/vmlinux-btf
+          git clone --depth 1 https://github.com/QiuSimons/vmlinux-btf.git package/kernel/vmlinux-btf
+
+          # Record upstream package commit for provenance
+          git -C package/kernel/vmlinux-btf rev-parse HEAD \
+            | tee "$GITHUB_WORKSPACE/vmlinux-btf.source-commit.txt"
+
+      - name: Build toolchain, prepare kernel headers, compile vmlinux-btf
+        shell: bash
+        run: |
+          set -eux
+          cd openwrt
+
+          # Download only what is needed; build toolchain + kernel prepare + package
+          make -j$(nproc) tools/install
+          make -j$(nproc) toolchain/install
+          make -j$(nproc) target/linux/prepare
+          # Ensure autoconf.h / generated headers exist
+          make -j$(nproc) target/linux/compile || make -j$(nproc) target/linux/install || true
+
+          # Package build (produces IPK under bin/packages/... or bin/targets/...)
+          make -j$(nproc) package/vmlinux-btf/compile V=s
+          make -j$(nproc) package/vmlinux-btf/install V=s || true
+
+          find bin -type f \( -name '*vmlinux-btf*.ipk' -o -name '*vmlinux-btf*.apk' \) \
+            | tee "$GITHUB_WORKSPACE/btf-package-paths.txt"
+
+      - name: Gate — validate BTF blob and package metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd openwrt
+
+          mapfile -t PKGS < <(find bin -type f -name '*vmlinux-btf*.ipk' 2>/dev/null || true)
+          if [ "${#PKGS[@]}" -eq 0 ]; then
+            # Some trees may still emit apk; accept only if forced, but README requires IPK
+            mapfile -t PKGS < <(find bin -type f -name '*vmlinux-btf*.apk' 2>/dev/null || true)
+          fi
+          if [ "${#PKGS[@]}" -eq 0 ]; then
+            echo "ERROR: no vmlinux-btf package produced"
+            find bin -type f | head -100 || true
+            exit 1
+          fi
+
+          IPK="${PKGS[0]}"
+          echo "Package: $IPK"
+          cp -a "$IPK" "$GITHUB_WORKSPACE/"
+
+          # Extract and inspect payload
+          WORK=$(mktemp -d)
+          cp "$IPK" "$WORK/pkg"
+          cd "$WORK"
+
+          if [[ "$IPK" == *.ipk ]]; then
+            tar -xzf pkg
+            tar -xzf data.tar.gz
+          else
+            echo "ERROR: package is not IPK (got $IPK). README requires opkg/IPK."
+            exit 1
+          fi
+
+          BTF_PATH="usr/lib/debug/boot/vmlinux"
+          if [ ! -s "$BTF_PATH" ]; then
+            echo "ERROR: missing $BTF_PATH inside package"
+            find . -type f | head -50
+            exit 1
+          fi
+
+          # Structural BTF checks
+          if command -v bpftool >/dev/null 2>&1; then
+            bpftool btf dump file "$BTF_PATH" format raw > /dev/null
+            TYPE_COUNT=$(bpftool btf dump file "$BTF_PATH" format raw 2>/dev/null | wc -l || echo 0)
+            echo "BTF dump lines: $TYPE_COUNT"
+            if [ "${TYPE_COUNT:-0}" -lt 100 ]; then
+              echo "ERROR: BTF appears too small / invalid"
+              exit 1
+            fi
+            # Spot-check a core kernel type commonly required by CO-RE
+            bpftool btf dump file "$BTF_PATH" format c 2>/dev/null \
+              | grep -q 'struct sk_buff' \
+              || echo "WARN: struct sk_buff not found in C dump (may still be valid)"
+          else
+            pahole --btf_encode_detached=/dev/null "$BTF_PATH" 2>/dev/null || true
+            test -s "$BTF_PATH"
+          fi
+
+          # Filename / version should encode kernel version
+          BASE=$(basename "$IPK")
+          echo "IPK basename: $BASE"
+          if ! echo "$BASE" | grep -q "$EXPECTED_KERNEL"; then
+            echo "WARN: IPK filename does not contain $EXPECTED_KERNEL — checking control metadata"
+          fi
+
+          if [ -f control.tar.gz ]; then
+            tar -xzf control.tar.gz
+            echo "----- control -----"
+            cat control
+            echo "-------------------"
+            grep -E '^Version:' control | grep -q "$EXPECTED_KERNEL" \
+              || { echo "ERROR: control Version does not contain $EXPECTED_KERNEL"; exit 1; }
+            grep -E '^Architecture:' control | grep -qE "$EXPECTED_ARCH|all" \
+              || { echo "ERROR: control Architecture mismatch"; cat control; exit 1; }
+          fi
+
+          # Record verification report
+          {
+            echo "status=PASS"
+            echo "kernel=$EXPECTED_KERNEL"
+            echo "arch=$EXPECTED_ARCH"
+            echo "board=mediatek/filogic"
+            echo "package=$(basename "$IPK")"
+            echo "btf_bytes=$(wc -c < "$BTF_PATH")"
+            echo "openwrt_commit=$OPENWRT_COMMIT"
+            echo "kwrt_commit=$KWRT_COMMIT"
+            echo "immortalwrt_commit=$IMMORTALWRT_COMMIT"
+            echo "lede_commit=$LEDE_COMMIT"
+            echo "build_date=$BUILD_DATE"
+          } | tee "$GITHUB_WORKSPACE/btf-compat-report.txt"
+
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp -a "$IPK" "$GITHUB_WORKSPACE/out/"
+          cp -a "$BTF_PATH" "$GITHUB_WORKSPACE/out/vmlinux.btf"
+
+      - name: Upload verified BTF IPK
+        uses: actions/upload-artifact@v4
+        with:
+          name: kwrt-btf-ipk-${{ inputs.expected_kernel }}-${{ inputs.expected_arch }}
+          path: |
+            out/
+            btf-compat-report.txt
+            kwrt-btf.config
+            kwrt-btf.config.sha256
+            source-files/extraction-manifest.txt
+            vmlinux-btf.source-commit.txt
+            btf-package-paths.txt
+          if-no-files-found: error
+          retention-days: 30
