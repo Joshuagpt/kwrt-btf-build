@@ -225,10 +225,19 @@ jobs:
           sed -i '\|wget -N .*Config-kernel.in|d' devices/common/diy.sh
           sed -i '\|wget -N .*613-netfilter_optional_tcp_window_check.patch|d' devices/common/diy.sh
 
-          # diy.sh waits on REPO_TOKEN for kiddin9/op-packages CI; skip that loop in this job
-          sed -i '/REPO_TOKEN/d' devices/common/diy.sh
-          sed -i '/while \[\[ \"\$status\"/d' devices/common/diy.sh
-          sed -i '/wait 5s/d' devices/common/diy.sh
+          # Remove the entire REPO_TOKEN wait block as one unit (status= … done).
+          # Deleting only some lines leaves a dangling `done` and breaks bash.
+          awk '
+            /REPO_TOKEN/ && /status=/ { skip=1; next }
+            skip && /^[[:space:]]*done[[:space:]]*$/ { skip=0; next }
+            skip { next }
+            { print }
+          ' devices/common/diy.sh > devices/common/diy.sh.patched
+          mv devices/common/diy.sh.patched devices/common/diy.sh
+          chmod +x devices/common/diy.sh
+
+          # Sanity: diy.sh must still be valid bash
+          bash -n devices/common/diy.sh
 
           bash devices/common/diy.sh
 
