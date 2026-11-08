@@ -16,7 +16,6 @@ jobs:
   replay:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
-
     env:
       TZ: Asia/Shanghai
       BUILD_DATE: ${{ inputs.build_date }}
@@ -67,7 +66,6 @@ jobs:
           set -eux
 
           cp -a kwrt/devices openwrt/
-
           mkdir -p openwrt/package/kernel/linux/modules
           mkdir -p openwrt/package/network/utils/nftables/patches
           mkdir -p openwrt/package/libs/libnftnl/patches
@@ -77,7 +75,6 @@ jobs:
           mkdir -p openwrt/target/linux/generic/hack-6.12
           mkdir -p openwrt/target/linux/generic/pending-6.12
           mkdir -p "$GITHUB_WORKSPACE/source-files"
-
           : > "$GITHUB_WORKSPACE/source-files/extraction-manifest.txt"
 
           extract_exact() {
@@ -95,7 +92,7 @@ jobs:
             if ! git -C "$repo" cat-file -e "$commit:$source" 2>/dev/null; then
               echo "ERROR: Source path does not exist: $source"
               git -C "$repo" ls-tree -r --name-only "$commit" \
-                | grep -Ei "$(basename "$source")" || true
+                | grep -Fi "$(basename "$source")" || true
               return 1
             fi
 
@@ -107,28 +104,50 @@ jobs:
               >> "$GITHUB_WORKSPACE/source-files/extraction-manifest.txt"
           }
 
-          extract_unique() {
+          extract_content_match() {
             local repo="$1"
             local commit="$2"
-            local pattern="$3"
-            local destination="$4"
+            local directory="$3"
+            local keyword="$4"
+            local destination="$5"
 
             local matches=()
+            local path
 
-            mapfile -t matches < <(
-              git -C "$repo" ls-tree -r --name-only "$commit" \
-                | grep -Ei "$pattern" || true
+            while IFS= read -r path; do
+              case "$path" in
+                "$directory/"*.patch)
+                  if git -C "$repo" show "$commit:$path" \
+                    | grep -qiF -- "$keyword"; then
+                    matches+=("$path")
+                  fi
+                  ;;
+              esac
+            done < <(
+              git -C "$repo" ls-tree -r --name-only "$commit"
             )
 
-            echo "===== SEARCH SOURCE ====="
+            echo "===== SEARCH PATCH CONTENT ====="
             echo "Repository: $repo"
             echo "Commit: $commit"
-            echo "Pattern: $pattern"
+            echo "Directory: $directory"
+            echo "Keyword: $keyword"
 
             if [ "${#matches[@]}" -ne 1 ]; then
-              echo "ERROR: Expected exactly one matching source file."
+              echo "ERROR: Expected exactly one matching patch."
               echo "Actual matches: ${#matches[@]}"
               printf '%s\n' "${matches[@]}"
+
+              echo "===== PATCH FILES IN DIRECTORY ====="
+              git -C "$repo" ls-tree -r --name-only "$commit" \
+                | while IFS= read -r candidate; do
+                    case "$candidate" in
+                      "$directory/"*.patch)
+                        echo "$candidate"
+                        ;;
+                    esac
+                  done
+
               return 1
             fi
 
@@ -144,22 +163,25 @@ jobs:
             package/kernel/linux/modules/video.mk \
             openwrt/package/kernel/linux/modules/video.mk
 
-          extract_unique \
+          extract_content_match \
             immortalwrt \
             "$IMMORTALWRT_COMMIT" \
-            '(^|/)nftables/.*fullcone.*\.patch$' \
+            package/network/utils/nftables \
+            fullcone \
             openwrt/package/network/utils/nftables/patches/002-fullcone.patch
 
-          extract_unique \
+          extract_content_match \
             immortalwrt \
             "$IMMORTALWRT_COMMIT" \
-            '(^|/)libnftnl/.*fullcone.*\.patch$' \
+            package/libs/libnftnl \
+            fullcone \
             openwrt/package/libs/libnftnl/patches/001-fullcone.patch
 
-          extract_unique \
+          extract_content_match \
             immortalwrt \
             "$IMMORTALWRT_COMMIT" \
-            '(^|/)wireless-regdb/.*(txpower|dfs).*\.patch$' \
+            package/firmware/wireless-regdb \
+            txpower \
             openwrt/package/firmware/wireless-regdb/patches/600-custom.patch
 
           extract_exact \
@@ -168,10 +190,11 @@ jobs:
             config/Config-kernel.in \
             openwrt/config/Config-kernel.in
 
-          extract_unique \
+          extract_content_match \
             lede \
             "$LEDE_COMMIT" \
-            '(^|/)fstools/.*ntfs.*utf8.*\.patch$' \
+            package/system/fstools \
+            ntfs \
             openwrt/package/system/fstools/patches/0200-ntfs3-with-utf8.patch
 
           extract_exact \
@@ -301,7 +324,6 @@ jobs:
 
           sed -n '/# Wireless Drivers/,/# end of Wireless Drivers/p' \
             .config | sed -e 's/=m/=n/' >> .config
-
           sed -i 's/\(kmod-qca.*\)=m/\1=n/' .config
 
           make defconfig
