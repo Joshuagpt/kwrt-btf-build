@@ -65,7 +65,41 @@ jobs:
 
           git -C kwrt checkout "$KWRT_COMMIT"
 
+          git clone --filter=blob:none \
+            --single-branch --branch master \
+            https://github.com/openwrt/packages.git packages
+
+          PACKAGES_COMMIT="$(git -C packages rev-list -1 \
+            --before="$BUILD_DATE 23:59:59 +0800" \
+            refs/remotes/origin/master)"
+
+          test -n "$PACKAGES_COMMIT"
+          echo "PACKAGES_COMMIT=$PACKAGES_COMMIT" >> "$GITHUB_ENV"
+
+          git -C packages checkout "$PACKAGES_COMMIT"
+
+      - name: Diagnose pinned patch paths
+        run: |
+          set -eux
+
+          echo "===== IMMORTALWRT FULLCONE PATHS ====="
+          git -C immortalwrt ls-tree -r --name-only "$IMMORTALWRT_COMMIT" \
+            | grep -Ei 'fullcone|nftables.*patch' || true
+
+          echo "===== IMMORTALWRT LIBNFTNL PATHS ====="
+          git -C immortalwrt ls-tree -r --name-only "$IMMORTALWRT_COMMIT" \
+            | grep -Ei 'libnftnl.*fullcone|fullcone.*libnftnl' || true
+
+          echo "===== IMMORTALWRT OTHER FILES ====="
+          git -C immortalwrt ls-tree -r --name-only "$IMMORTALWRT_COMMIT" \
+            | grep -E '(^|/)(video\.mk|Config-kernel\.in|600-custom-change-txpower-and-dfs\.patch)$' || true
+
+          echo "===== LEDE PATCH PATHS ====="
+          git -C lede ls-tree -r --name-only "$LEDE_COMMIT" \
+            | grep -Ei 'ntfs3-with-utf8|netfilter_optional_tcp_window_check|hack-6\.12' || true
+
       - name: Restore historical Kwrt configuration
+        shell: bash
         run: |
           set -eux
 
@@ -78,33 +112,81 @@ jobs:
           mkdir -p openwrt/package/system/fstools/patches
           mkdir -p openwrt/config
 
-          git -C immortalwrt show \
-            "$IMMORTALWRT_COMMIT:package/kernel/linux/modules/video.mk" \
-            > openwrt/package/kernel/linux/modules/video.mk
+          extract_basename() {
+            local repo="$1"
+            local commit="$2"
+            local filename="$3"
+            local destination="$4"
 
-          git -C immortalwrt show \
-            "$IMMORTALWRT_COMMIT:package/network/utils/nftables/patches/002-nftables-add-fullcone-expression-support.patch" \
-            > openwrt/package/network/utils/nftables/patches/002-nftables-add-fullcone-expression-support.patch
+            local matches
+            mapfile -t matches < <(
+              git -C "$repo" ls-tree -r --name-only "$commit" \
+                | awk -F/ -v name="$filename" '$NF == name'
+            )
 
-          git -C immortalwrt show \
-            "$IMMORTALWRT_COMMIT:package/libs/libnftnl/patches/001-libnftnl-add-fullcone-expression-support.patch" \
-            > openwrt/package/libs/libnftnl/patches/001-libnftnl-add-fullcone-expression-support.patch
+            if [ "${#matches[@]}" -ne 1 ]; then
+              echo "ERROR: Expected exactly one $filename in $repo"
+              printf '%s\n' "${matches[@]}"
+              return 1
+            fi
 
-          git -C immortalwrt show \
-            "$IMMORTALWRT_COMMIT:package/firmware/wireless-regdb/patches/600-custom-change-txpower-and-dfs.patch" \
-            > openwrt/package/firmware/wireless-regdb/patches/600-custom-change-txpower-and-dfs.patch
+            mkdir -p "$(dirname "$destination")"
+            git -C "$repo" show "$commit:${matches[0]}" > "$destination"
+            test -s "$destination"
+            echo "Extracted ${matches[0]}"
+          }
 
-          git -C immortalwrt show \
-            "$IMMORTALWRT_COMMIT:config/Config-kernel.in" \
-            > openwrt/config/Config-kernel.in
+          extract_pattern() {
+            local repo="$1"
+            local commit="$2"
+            local pattern="$3"
+            local destination="$4"
 
-          git -C lede show \
-            "$LEDE_COMMIT:package/system/fstools/patches/0200-ntfs3-with-utf8.patch" \
-            > openwrt/package/system/fstools/patches/0200-ntfs3-with-utf8.patch
+            local matches
+            mapfile -t matches < <(
+              git -C "$repo" ls-tree -r --name-only "$commit" \
+                | grep -Ei "$pattern" || true
+            )
 
-          git -C lede show \
-            "$LEDE_COMMIT:target/linux/generic/pending-6.12/613-netfilter_optional_tcp_window_check.patch" \
-            > openwrt/target/linux/generic/pending-6.12/613-netfilter_optional_tcp_window_check.patch
+            if [ "${#matches[@]}" -ne 1 ]; then
+              echo "ERROR: Expected exactly one match for $pattern"
+              printf '%s\n' "${matches[@]}"
+              return 1
+            fi
+
+            mkdir -p "$(dirname "$destination")"
+            git -C "$repo" show "$commit:${matches[0]}" > "$destination"
+            test -s "$destination"
+            echo "Extracted ${matches[0]}"
+          }
+
+          extract_basename immortalwrt "$IMMORTALWRT_COMMIT" \
+            video.mk \
+            openwrt/package/kernel/linux/modules/video.mk
+
+          extract_pattern immortalwrt "$IMMORTALWRT_COMMIT" \
+            '(^|/)nftables/patches/[^/]*fullcone[^/]*\.patch$' \
+            openwrt/package/network/utils/nftables/patches/002-nftables-add-fullcone-expression-support.patch
+
+          extract_pattern immortalwrt "$IMMORTALWRT_COMMIT" \
+            '(^|/)libnftnl/patches/[^/]*fullcone[^/]*\.patch$' \
+            openwrt/package/libs/libnftnl/patches/001-libnftnl-add-fullcone-expression-support.patch
+
+          extract_basename immortalwrt "$IMMORTALWRT_COMMIT" \
+            600-custom-change-txpower-and-dfs.patch \
+            openwrt/package/firmware/wireless-regdb/patches/600-custom-change-txpower-and-dfs.patch
+
+          extract_basename immortalwrt "$IMMORTALWRT_COMMIT" \
+            Config-kernel.in \
+            openwrt/config/Config-kernel.in
+
+          extract_basename lede "$LEDE_COMMIT" \
+            0200-ntfs3-with-utf8.patch \
+            openwrt/package/system/fstools/patches/0200-ntfs3-with-utf8.patch
+
+          extract_basename lede "$LEDE_COMMIT" \
+            613-netfilter_optional_tcp_window_check.patch \
+            openwrt/target/linux/generic/pending-6.12/613-netfilter_optional_tcp_window_check.patch
 
           mkdir -p openwrt/target/linux/generic/hack-6.12
 
@@ -113,6 +195,7 @@ jobs:
             | tar -x -C openwrt
 
       - name: Prepare historical DIY environment
+        shell: bash
         run: |
           set -eux
 
@@ -120,18 +203,21 @@ jobs:
 
           export PIN_IMMORTALWRT="$GITHUB_WORKSPACE/immortalwrt"
           export PIN_LEDE="$GITHUB_WORKSPACE/lede"
+          export PIN_PACKAGES="$GITHUB_WORKSPACE/packages"
+
           export PIN_IMMORTALWRT_COMMIT="$IMMORTALWRT_COMMIT"
           export PIN_LEDE_COMMIT="$LEDE_COMMIT"
+          export PIN_PACKAGES_COMMIT="$PACKAGES_COMMIT"
 
           git_clone_path() {
             local branch="$1"
             local url="$2"
             shift 2
 
-            local move_mode="false"
+            local move_mode=false
 
             if [ "${1:-}" = "mv" ]; then
-              move_mode="true"
+              move_mode=true
               shift
             fi
 
@@ -147,8 +233,12 @@ jobs:
                 repo="$PIN_LEDE"
                 commit="$PIN_LEDE_COMMIT"
                 ;;
+              *openwrt/packages*)
+                repo="$PIN_PACKAGES"
+                commit="$PIN_PACKAGES_COMMIT"
+                ;;
               *)
-                echo "Unpinned repository: $url"
+                echo "ERROR: Unpinned repository: $url"
                 return 1
                 ;;
             esac
@@ -166,14 +256,13 @@ jobs:
             for path in "$@"; do
               mkdir -p "$root/$(dirname "$path")"
 
-              if [ "$move_mode" = "true" ]; then
+              if [ "$move_mode" = true ]; then
                 mkdir -p "$root/$path"
                 if [ -d "$temp/$path" ]; then
                   cp -an "$temp/$path/." "$root/$path/"
                 fi
               else
                 if [ -e "$temp/$path" ]; then
-                  mkdir -p "$root/$(dirname "$path")"
                   cp -an "$temp/$path" "$root/$path"
                 fi
               fi
@@ -183,22 +272,6 @@ jobs:
           }
 
           export -f git_clone_path
-
-          chmod +x devices/common/diy.sh
-
-          sed -i '/wget -N .*immortalwrt\/immortalwrt\/raw/d' \
-            devices/common/diy.sh
-
-          sed -i '/wget -N .*coolsnowwolf\/lede\/raw/d' \
-            devices/common/diy.sh
-
-          sed -i '/wget -N .*openwrt\/packages\/master/d' \
-            devices/common/diy.sh
-
-          sed -i '/status=$(curl /d' devices/common/diy.sh
-          sed -i '/while \[\[ "\$status"/d' devices/common/diy.sh
-          sed -i '/echo "wait 5s"/d' devices/common/diy.sh
-          sed -i '/sleep 5/d' devices/common/diy.sh
 
           bash devices/common/diy.sh
 
@@ -257,6 +330,9 @@ jobs:
             echo
             echo "LEDE commit:"
             git -C lede rev-parse HEAD
+            echo
+            echo "OpenWrt packages commit:"
+            git -C packages rev-parse HEAD
             echo
             echo "OpenWrt kernel version:"
             grep -E '^(LINUX_VERSION|LINUX_KERNEL_HASH)' \
