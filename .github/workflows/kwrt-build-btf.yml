@@ -391,55 +391,82 @@ jobs:
           set -eux
           cd openwrt
 
-          # Prefetch sources (kernel tarball, toolchain) so failures are clearer
+          CACHE_HIT="${{ steps.owrt-cache.outputs.cache-hit }}"
+          echo "OpenWrt tools/toolchain cache-hit=${CACHE_HIT}"
+
+          # Host cross-gcc presence = usable restored toolchain
+          CROSS_GCC="$(ls staging_dir/toolchain-*/bin/*-openwrt-linux-*-gcc 2>/dev/null | head -1 || true)"
+          HOST_OK=0
+          if [ -x staging_dir/host/bin/sed ] && [ -n "$CROSS_GCC" ] && [ -x "$CROSS_GCC" ]; then
+            HOST_OK=1
+          fi
+          echo "HOST_OK=${HOST_OK} CROSS_GCC=${CROSS_GCC:-none}"
+
+          # Always ensure downloads exist (cheap when dl/ is cached)
           make -j$(nproc) download || make -j1 download V=s
 
-          make -j$(nproc) tools/install
-
-          # toolchain/kernel-headers is the fragile step — capture verbose log on failure
-          if ! make -j$(nproc) toolchain/install; then
-            echo "===== toolchain/install failed; re-running kernel-headers with V=s ====="
-            make -j1 V=s toolchain/kernel-headers/compile 2>&1 | tee "$GITHUB_WORKSPACE/kernel-headers-fail.log" || true
-            make -j1 V=s toolchain/install 2>&1 | tee -a "$GITHUB_WORKSPACE/kernel-headers-fail.log" || true
-            echo "===== last 200 lines of verbose log ====="
-            tail -n 200 "$GITHUB_WORKSPACE/kernel-headers-fail.log" || true
-            exit 1
+          if [ "$HOST_OK" = "1" ]; then
+            echo "===== SKIP tools/install + toolchain/install (restored from cache) ====="
+          else
+            echo "===== Building tools + toolchain (cold or incomplete cache) ====="
+            make -j$(nproc) tools/install
+            if ! make -j$(nproc) toolchain/install; then
+              echo "===== toolchain/install failed; re-running kernel-headers with V=s ====="
+              make -j1 V=s toolchain/kernel-headers/compile 2>&1 | tee "$GITHUB_WORKSPACE/kernel-headers-fail.log" || true
+              make -j1 V=s toolchain/install 2>&1 | tee -a "$GITHUB_WORKSPACE/kernel-headers-fail.log" || true
+              echo "===== last 200 lines of verbose log ====="
+              tail -n 200 "$GITHUB_WORKSPACE/kernel-headers-fail.log" || true
+              exit 1
+            fi
           fi
 
+          # vmlinux-btf only needs prepared kernel tree + generated headers, not a full image
           if ! make -j$(nproc) target/linux/prepare; then
             echo "===== target/linux/prepare failed; verbose retry ====="
             make -j1 V=s target/linux/prepare 2>&1 | tee "$GITHUB_WORKSPACE/linux-prepare-fail.log"
             exit 1
           fi
 
-          # Headers / modules build — needed so LINUX_DIR has generated autoconf.h
-          make -j$(nproc) target/linux/compile || make -j$(nproc) target/linux/install || true
+          # Ensure autoconf.h exists; avoid full kernel vmlinux link when possible
+          AUTOCONF="$(find build_dir -path '*/linux-*/linux-*/include/generated/autoconf.h' 2>/dev/null | head -1 || true)"
+          if [ -z "$AUTOCONF" ]; then
+            echo "autoconf.h missing after prepare — running minimal linux compile"
+            make -j$(nproc) target/linux/compile || true
+          else
+            echo "Found autoconf.h: $AUTOCONF"
+          fi
 
-          # Package build (produces IPK under bin/packages/... or bin/targets/...)
+          # Package build
           make -j$(nproc) package/vmlinux-btf/compile V=s
           make -j$(nproc) package/vmlinux-btf/install V=s || true
 
-          find bin -type f \( -name '*vmlinux-btf*.ipk' -o -name '*vmlinux-btf*.apk' \) \
-            | tee "$GITHUB_WORKSPACE/btf-package-paths.txt"
+          # Save IPK immediately (absolute path) so validation bugs cannot lose the artifact
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          mapfile -t BUILT < <(find bin -type f \( -name '*vmlinux-btf*.ipk' -o -name '*vmlinux-btf*.apk' \) 2>/dev/null || true)
+          printf '%s\n' "${BUILT[@]:-}" | tee "$GITHUB_WORKSPACE/btf-package-paths.txt"
+          for f in "${BUILT[@]:-}"; do
+            [ -n "$f" ] || continue
+            cp -a "$(realpath "$f")" "$GITHUB_WORKSPACE/out/"
+          done
+          ls -la "$GITHUB_WORKSPACE/out/" || true
 
       - name: Gate — validate BTF blob and package metadata
         shell: bash
         run: |
           set -euo pipefail
-          cd openwrt
 
-          mapfile -t PKGS < <(find bin -type f -name '*vmlinux-btf*.ipk' 2>/dev/null || true)
+          # Prefer already-copied artifact from the build step
+          mapfile -t PKGS < <(find "$GITHUB_WORKSPACE/out" -type f -name '*vmlinux-btf*.ipk' 2>/dev/null || true)
           if [ "${#PKGS[@]}" -eq 0 ]; then
-            # Some trees may still emit apk; accept only if forced, but README requires IPK
-            mapfile -t PKGS < <(find bin -type f -name '*vmlinux-btf*.apk' 2>/dev/null || true)
+            mapfile -t PKGS < <(find openwrt/bin -type f -name '*vmlinux-btf*.ipk' 2>/dev/null || true)
           fi
           if [ "${#PKGS[@]}" -eq 0 ]; then
             echo "ERROR: no vmlinux-btf package produced"
-            find bin -type f | head -100 || true
+            find openwrt/bin -type f 2>/dev/null | head -100 || true
+            ls -la "$GITHUB_WORKSPACE/out" || true
             exit 1
           fi
 
-          # Resolve to absolute path before any cd — relative bin/... breaks later
           IPK="$(realpath "${PKGS[0]}")"
           echo "Package: $IPK"
           cp -a "$IPK" "$GITHUB_WORKSPACE/$(basename "$IPK")"
@@ -522,6 +549,7 @@ jobs:
           ls -la "$GITHUB_WORKSPACE/out/"
 
       - name: Upload verified BTF IPK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: kwrt-btf-ipk-${{ inputs.expected_kernel }}-${{ inputs.expected_arch }}
@@ -535,6 +563,19 @@ jobs:
             btf-package-paths.txt
           if-no-files-found: error
           retention-days: 30
+
+      # Even if the gate step fails, keep any IPK already produced by the build step
+      - name: Upload raw IPK (fallback if gate failed)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kwrt-btf-ipk-raw-unverified
+          path: |
+            out/
+            btf-package-paths.txt
+            btf-compat-report.txt
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload failure logs (if any)
         if: failure()
