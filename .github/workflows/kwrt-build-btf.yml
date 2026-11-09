@@ -439,13 +439,14 @@ jobs:
             exit 1
           fi
 
-          IPK="${PKGS[0]}"
+          # Resolve to absolute path before any cd — relative bin/... breaks later
+          IPK="$(realpath "${PKGS[0]}")"
           echo "Package: $IPK"
-          cp -a "$IPK" "$GITHUB_WORKSPACE/"
+          cp -a "$IPK" "$GITHUB_WORKSPACE/$(basename "$IPK")"
 
           # Extract and inspect payload
           WORK=$(mktemp -d)
-          cp "$IPK" "$WORK/pkg"
+          cp -a "$IPK" "$WORK/pkg"
           cd "$WORK"
 
           if [[ "$IPK" == *.ipk ]]; then
@@ -515,8 +516,10 @@ jobs:
           } | tee "$GITHUB_WORKSPACE/btf-compat-report.txt"
 
           mkdir -p "$GITHUB_WORKSPACE/out"
+          # $IPK is absolute; $BTF_PATH is relative to $WORK
           cp -a "$IPK" "$GITHUB_WORKSPACE/out/"
           cp -a "$BTF_PATH" "$GITHUB_WORKSPACE/out/vmlinux.btf"
+          ls -la "$GITHUB_WORKSPACE/out/"
 
       - name: Upload verified BTF IPK
         uses: actions/upload-artifact@v4
