@@ -106,6 +106,23 @@ jobs:
             https://github.com/kiddin9/Kwrt.git kwrt
           git -C kwrt checkout "$KWRT_COMMIT"
 
+      # Restore tools/toolchain/dl so subsequent runs skip the multi-hour cold build.
+      # Keyed by OpenWrt commit + target arch — safe across BTF-only config tweaks.
+      - name: Restore OpenWrt build cache
+        id: owrt-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            openwrt/dl
+            openwrt/staging_dir/host
+            openwrt/staging_dir/toolchain-*
+            openwrt/build_dir/host
+            openwrt/build_dir/toolchain-*
+          key: owrt-tools-${{ runner.os }}-${{ env.OPENWRT_COMMIT }}-${{ env.EXPECTED_ARCH }}
+          restore-keys: |
+            owrt-tools-${{ runner.os }}-${{ env.OPENWRT_COMMIT }}-
+            owrt-tools-${{ runner.os }}-
+
       - name: Restore historical Kwrt configuration
         shell: bash
         run: |
@@ -185,6 +202,13 @@ jobs:
             target/linux/generic/hack-6.12 \
             | tar -x -C openwrt
 
+          # LEDE's 200-tools_portability.patch does not apply to OpenWrt's
+          # linux-6.12.74 (Hunk #1 FAILED on tools/scripts/Makefile.include).
+          # It only affects host-side kernel *tools* portability, not kernel
+          # struct layouts used for detached BTF — safe to drop.
+          rm -f openwrt/target/linux/generic/hack-6.12/200-tools_portability.patch
+          rm -f openwrt/target/linux/generic/hack-6.12/200-tools_portability.patch.rej
+
           cat "$GITHUB_WORKSPACE/source-files/extraction-manifest.txt"
 
       - name: Prepare historical DIY environment
@@ -225,6 +249,10 @@ jobs:
           sed -i '\|wget -N .*Config-kernel.in|d' devices/common/diy.sh
           sed -i '\|wget -N .*613-netfilter_optional_tcp_window_check.patch|d' devices/common/diy.sh
 
+          # Keep our pinned LEDE hack-6.12; do not overwrite from lede master
+          sed -i '\|git_clone_path master .*coolsnowwolf/lede.*hack-6.12|d' devices/common/diy.sh
+          sed -i '\|git_clone_path master .*lede.*hack-6.12|d' devices/common/diy.sh
+
           # Remove the entire REPO_TOKEN wait block as one unit (status= … done).
           # Deleting only some lines leaves a dangling `done` and breaks bash.
           awk '
@@ -241,6 +269,11 @@ jobs:
 
           bash devices/common/diy.sh
 
+          # diy.sh must not have reintroduced the broken portability patch
+          rm -f target/linux/generic/hack-6.12/200-tools_portability.patch
+          rm -f target/linux/generic/hack-6.12/200-tools_portability.patch.rej
+          ls target/linux/generic/hack-6.12/ | head -30 || true
+
           cp -f devices/common/.config .config
           if [ -f devices/mediatek_filogic/.config ]; then
             cat devices/mediatek_filogic/.config >> .config
@@ -248,6 +281,9 @@ jobs:
           if [ -f devices/mediatek_filogic/diy.sh ]; then
             bash devices/mediatek_filogic/diy.sh || true
           fi
+
+          # Final guard after device diy
+          rm -f target/linux/generic/hack-6.12/200-tools_portability.patch
 
       - name: Reproduce Kwrt defconfig and apply BTF-only overlay
         shell: bash
