@@ -106,22 +106,21 @@ jobs:
             https://github.com/kiddin9/Kwrt.git kwrt
           git -C kwrt checkout "$KWRT_COMMIT"
 
-      # Restore tools/toolchain/dl so subsequent runs skip the multi-hour cold build.
-      # Keyed by OpenWrt commit + target arch — safe across BTF-only config tweaks.
+      # Restore tools/toolchain/dl. Use restore+save split so we can force-save
+      # after toolchain even when the job later fails (single cache@v4 post often
+      # never wrote anything for this repo — 0 caches).
+      # Do NOT cache build_dir (multi-GB, exceeds practical limits).
       - name: Restore OpenWrt build cache
         id: owrt-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             openwrt/dl
-            openwrt/staging_dir/host
-            openwrt/staging_dir/toolchain-*
-            openwrt/build_dir/host
-            openwrt/build_dir/toolchain-*
-          key: owrt-tools-${{ runner.os }}-${{ env.OPENWRT_COMMIT }}-${{ env.EXPECTED_ARCH }}
+            openwrt/staging_dir
+          key: owrt-st-${{ runner.os }}-${{ env.OPENWRT_COMMIT }}-${{ env.EXPECTED_ARCH }}-v2
           restore-keys: |
-            owrt-tools-${{ runner.os }}-${{ env.OPENWRT_COMMIT }}-
-            owrt-tools-${{ runner.os }}-
+            owrt-st-${{ runner.os }}-${{ env.OPENWRT_COMMIT }}-${{ env.EXPECTED_ARCH }}-
+            owrt-st-${{ runner.os }}-${{ env.OPENWRT_COMMIT }}-
 
       - name: Restore historical Kwrt configuration
         shell: bash
@@ -450,6 +449,20 @@ jobs:
           done
           ls -la "$GITHUB_WORKSPACE/out/" || true
 
+          # Show cache-relevant sizes for diagnostics
+          du -sh dl staging_dir 2>/dev/null || true
+          du -sh staging_dir/* 2>/dev/null | head -20 || true
+
+      # Explicit save — runs even if a later step fails; only skip if nothing useful
+      - name: Save OpenWrt staging cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            openwrt/dl
+            openwrt/staging_dir
+          key: owrt-st-${{ runner.os }}-${{ env.OPENWRT_COMMIT }}-${{ env.EXPECTED_ARCH }}-v2
+
       - name: Gate — validate BTF blob and package metadata
         shell: bash
         run: |
@@ -543,8 +556,13 @@ jobs:
           } | tee "$GITHUB_WORKSPACE/btf-compat-report.txt"
 
           mkdir -p "$GITHUB_WORKSPACE/out"
-          # $IPK is absolute; $BTF_PATH is relative to $WORK
-          cp -a "$IPK" "$GITHUB_WORKSPACE/out/"
+          # IPK may already live under out/ (copied in the build step) — do not
+          # cp onto itself (GNU cp errors: "are the same file").
+          OUT_IPK="$GITHUB_WORKSPACE/out/$(basename "$IPK")"
+          if [ "$(realpath "$IPK")" != "$(realpath "$OUT_IPK" 2>/dev/null || echo)" ]; then
+            cp -a "$IPK" "$OUT_IPK"
+          fi
+          # $BTF_PATH is relative to $WORK
           cp -a "$BTF_PATH" "$GITHUB_WORKSPACE/out/vmlinux.btf"
           ls -la "$GITHUB_WORKSPACE/out/"
 
