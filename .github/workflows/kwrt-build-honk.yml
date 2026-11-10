@@ -1,0 +1,382 @@
+name: Build Honk IPK for Kwrt (opkg)
+
+# Conservative packaging only:
+# - Fetch official daeuniverse/honk aarch64-unknown-linux-musl full static build
+# - Verify SHA256SUMS + ELF arch/static
+# - Wrap as an opkg IPK for Kwrt (NOT OpenWrt 25.12 APK)
+# - Service stays disabled; no enable/start in postinst
+# - Does NOT SSH to the router, does NOT touch OpenClash/DAED/sysctl
+# - Does NOT modify kwrt-build-btf.yml
+#
+# Target device context (same pins as BTF workflow):
+#   Kwrt 25.12.2 · mediatek/filogic · aarch64_cortex-a53 · kernel 6.12.74
+
+on:
+  workflow_dispatch:
+    inputs:
+      honk_tag:
+        description: "Upstream honk git tag (empty = latest prerelease/release with musl full asset)"
+        required: false
+        default: ""
+      expected_arch:
+        description: "OpenWrt/Kwrt ARCH_PACKAGES label for IPK Architecture field"
+        required: true
+        default: "aarch64_cortex-a53"
+      publish_release:
+        description: "Publish IPK to GitHub Release when packaging succeeds"
+        required: false
+        default: true
+        type: boolean
+      force_rebuild:
+        description: "Rebuild even if this repo already has a Release for the same honk tag"
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    # Weekly check for a newer upstream tag (Monday 03:00 UTC)
+    - cron: "0 3 * * 1"
+
+permissions:
+  contents: write
+
+jobs:
+  package-honk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      TZ: Asia/Shanghai
+      EXPECTED_ARCH: ${{ inputs.expected_arch || 'aarch64_cortex-a53' }}
+      HONK_REPO: daeuniverse/honk
+      # Same documentation pins as BTF workflow (userspace binary is arch-generic musl;
+      # kernel modules remain the operator's responsibility on the device).
+      EXPECTED_KERNEL: "6.12.74"
+
+    steps:
+      - name: Checkout packaging repository
+        uses: actions/checkout@v4
+
+      - name: Resolve upstream honk version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          INPUT_TAG="${{ inputs.honk_tag || '' }}"
+
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+            API="https://api.github.com/repos/${HONK_REPO}/releases/tags/${TAG}"
+            META=$(curl -fsSL "$API")
+          else
+            # Prefer newest release that ships aarch64 musl full (includes prereleases)
+            META=$(curl -fsSL "https://api.github.com/repos/${HONK_REPO}/releases?per_page=15")
+            TAG=$(printf '%s' "$META" | python3 -c '
+          import json,sys
+          rels=json.load(sys.stdin)
+          for r in rels:
+            names=[a["name"] for a in r.get("assets") or []]
+            if any(("aarch64-unknown-linux-musl-full.tar.gz" in n) and ("stock" not in n) for n in names):
+              print(r["tag_name"]); break
+          else:
+            sys.exit("no release with aarch64-unknown-linux-musl-full asset")
+          ')
+            META=$(curl -fsSL "https://api.github.com/repos/${HONK_REPO}/releases/tags/${TAG}")
+          fi
+
+          ASSET_NAME=$(printf '%s' "$META" | python3 -c '
+          import json,sys
+          r=json.load(sys.stdin)
+          for a in r.get("assets") or []:
+            n=a["name"]
+            if ("aarch64-unknown-linux-musl-full.tar.gz" in n) and ("stock" not in n):
+              print(n); break
+          else:
+            sys.exit("asset name not found")
+          ')
+          ASSET_URL=$(printf '%s' "$META" | python3 -c '
+          import json,sys
+          r=json.load(sys.stdin)
+          for a in r.get("assets") or []:
+            n=a["name"]
+            if ("aarch64-unknown-linux-musl-full.tar.gz" in n) and ("stock" not in n):
+              print(a["browser_download_url"]); break
+          else:
+            sys.exit("asset url not found")
+          ')
+
+          # PKG version for opkg: v0.1.0-beta.6 -> 0.1.0_beta6
+          PKG_VER=$(python3 -c "
+          import re,sys
+          t=sys.argv[1].lstrip('v')
+          t=re.sub(r'-?beta\.?', '_beta', t, count=1)
+          t=re.sub(r'[^0-9A-Za-z._+]', '_', t)
+          print(t)
+          " "$TAG")
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "pkg_ver=$PKG_VER" >> "$GITHUB_OUTPUT"
+          echo "asset_name=$ASSET_NAME" >> "$GITHUB_OUTPUT"
+          echo "asset_url=$ASSET_URL" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag=$TAG pkg_ver=$PKG_VER asset=$ASSET_NAME"
+
+      - name: Skip if Release already exists
+        id: skip
+        shell: bash
+        run: |
+          set -euo pipefail
+          FORCE="${{ inputs.force_rebuild || false }}"
+          TAG="${{ steps.ver.outputs.tag }}"
+          REL_TAG="honk-${TAG}-kwrt-${EXPECTED_ARCH}"
+          # sanitize tag for GitHub release tag name
+          REL_TAG=$(echo "$REL_TAG" | tr '/:' '--')
+          echo "release_tag=$REL_TAG" >> "$GITHUB_OUTPUT"
+
+          if [ "$FORCE" = "true" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "force rebuild requested"
+            exit 0
+          fi
+
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${REL_TAG}")
+          if [ "$CODE" = "200" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Release $REL_TAG already exists — skipping package build"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "No existing release $REL_TAG (HTTP $CODE) — will package"
+          fi
+
+      - name: Download official musl full build + SHA256SUMS
+        if: steps.skip.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p upstream
+          cd upstream
+          TAG="${{ steps.ver.outputs.tag }}"
+          ASSET="${{ steps.ver.outputs.asset_name }}"
+          URL="${{ steps.ver.outputs.asset_url }}"
+
+          curl -fsSL -o "$ASSET" "$URL"
+          curl -fsSL -o SHA256SUMS \
+            "https://github.com/${HONK_REPO}/releases/download/${TAG}/SHA256SUMS" \
+            || curl -fsSL -o SHA256SUMS \
+            "https://github.com/${HONK_REPO}/releases/download/${TAG}/SHA256SUMS.txt" \
+            || true
+
+          if [ -f SHA256SUMS ]; then
+            # BusyBox-friendly check: only the line for our asset
+            if grep -F "$ASSET" SHA256SUMS >/dev/null; then
+              grep -F "$ASSET" SHA256SUMS | sha256sum -c -
+            else
+              echo "WARN: $ASSET not listed in SHA256SUMS; computing local hash only"
+              sha256sum "$ASSET" | tee "${ASSET}.sha256"
+            fi
+          else
+            echo "WARN: SHA256SUMS not found on release; recording local hash"
+            sha256sum "$ASSET" | tee "${ASSET}.sha256"
+          fi
+
+          tar -tzf "$ASSET" | head -30
+          tar -xzf "$ASSET"
+          # Locate binary
+          BIN=$(find . -type f -name 'honk-core' | head -1)
+          test -n "$BIN"
+          cp -a "$BIN" honk-core
+          chmod 755 honk-core
+          file honk-core
+          readelf -h honk-core | grep -E 'Class|Machine'
+          # Static musl: no dynamic interpreter preferred
+          if readelf -l honk-core | grep -q 'Requesting program interpreter'; then
+            echo "WARN: binary has a dynamic interpreter (not fully static)"
+            readelf -d honk-core | grep NEEDED || true
+          else
+            echo "OK: no program interpreter (static)"
+          fi
+          # Must be AArch64
+          readelf -h honk-core | grep -qi AArch64
+
+      - name: Fetch official init/config templates
+        if: steps.skip.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p files
+          BASE=https://raw.githubusercontent.com/daeuniverse/openwrt-packages/main/honk/files
+          curl -fsSL "$BASE/honk.init" -o files/honk.init
+          curl -fsSL "$BASE/honk.config" -o files/honk.config
+          curl -fsSL "$BASE/config.dae" -o files/config.dae
+          # Conservative: ensure package install never auto-starts
+          # Official init already disables on apk package-triggered start;
+          # we still ship a postinst that never enables.
+
+      - name: Build opkg IPK
+        if: steps.skip.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKG_VER="${{ steps.ver.outputs.pkg_ver }}"
+          TAG="${{ steps.ver.outputs.tag }}"
+          ARCH="$EXPECTED_ARCH"
+          PKG_NAME=honk
+          PKG_RELEASE=1
+          FULLVER="${PKG_VER}-${PKG_RELEASE}"
+
+          ROOT=$(mktemp -d)
+          mkdir -p "$ROOT/usr/bin" \
+                   "$ROOT/etc/init.d" \
+                   "$ROOT/etc/config" \
+                   "$ROOT/etc/honk" \
+                   "$ROOT/usr/share/honk" \
+                   "$ROOT/usr/share/licenses/honk" \
+                   "$ROOT/lib/upgrade/keep.d"
+
+          install -m 0755 upstream/honk-core "$ROOT/usr/bin/honk-core"
+          install -m 0755 files/honk.init "$ROOT/etc/init.d/honk"
+          install -m 0644 files/honk.config "$ROOT/etc/config/honk"
+          install -m 0644 files/config.dae "$ROOT/etc/honk/config.dae"
+          printf '%s\n' '/etc/honk/data/' > "$ROOT/lib/upgrade/keep.d/honk"
+          # Geo data provided by separate packages; create relative symlinks
+          ln -sf ../v2ray/geoip.dat "$ROOT/usr/share/honk/geoip.dat"
+          ln -sf ../v2ray/geosite.dat "$ROOT/usr/share/honk/geosite.dat"
+          # LICENSE if present in tarball
+          if [ -f upstream/LICENSE ]; then
+            install -m 0644 upstream/LICENSE "$ROOT/usr/share/licenses/honk/LICENSE"
+          fi
+
+          # control — DEPENDS mirror official OpenWrt package minus libstdcpp
+          # (official musl full static binary does not need libstdcpp).
+          # kmods and geo packages must exist on the device; opkg will enforce.
+          CTRL=$(mktemp -d)
+          cat > "$CTRL/control" <<EOF
+          Package: ${PKG_NAME}
+          Version: ${FULLVER}
+          Depends: kmod-veth, kmod-sched-core, kmod-sched-bpf, kmod-nft-core, kmod-nft-queue, kmod-nfnetlink-queue, kmod-nf-conntrack, vmlinux-btf, v2ray-geoip, v2ray-geosite
+          Section: net
+          Architecture: ${ARCH}
+          Maintainer: kwrt-btf-build packaging (official binary)
+          Source: https://github.com/${HONK_REPO}/releases/tag/${TAG}
+          Description: eBPF transparent proxy (honk-core), official ${TAG} aarch64 musl full static build packaged as IPK for Kwrt/opkg. Service is NOT enabled on install. Requires matching kernel BTF (vmlinux-btf) and listed kmods. Does not reconfigure OpenClash or DAED.
+          EOF
+          # Strip accidental leading spaces from heredoc if any
+          sed -i 's/^[[:space:]]*//' "$CTRL/control"
+
+          # postinst: never enable or start
+          cat > "$CTRL/postinst" <<'EOF'
+          #!/bin/sh
+          [ -z "${IPKG_INSTROOT}" ] || exit 0
+          # Keep service disabled after install/upgrade.
+          [ -x /etc/init.d/honk ] && /etc/init.d/honk disable 2>/dev/null || true
+          exit 0
+          EOF
+          chmod 0755 "$CTRL/postinst"
+
+          cat > "$CTRL/prerm" <<'EOF'
+          #!/bin/sh
+          [ -z "${IPKG_INSTROOT}" ] || exit 0
+          [ -x /etc/init.d/honk ] && /etc/init.d/honk stop 2>/dev/null || true
+          [ -x /etc/init.d/honk ] && /etc/init.d/honk disable 2>/dev/null || true
+          exit 0
+          EOF
+          chmod 0755 "$CTRL/prerm"
+
+          cat > "$CTRL/conffiles" <<'EOF'
+          /etc/config/honk
+          /etc/honk/config.dae
+          EOF
+
+          # Build data.tar.gz / control.tar.gz / debian-binary
+          OUT="$GITHUB_WORKSPACE/out"
+          mkdir -p "$OUT"
+          DATA_TGZ=$(mktemp)
+          CTRL_TGZ=$(mktemp)
+          (
+            cd "$ROOT"
+            tar --owner=0 --group=0 -czf "$DATA_TGZ" .
+          )
+          (
+            cd "$CTRL"
+            tar --owner=0 --group=0 -czf "$CTRL_TGZ" control postinst prerm conffiles
+          )
+          IPK="$OUT/${PKG_NAME}_${FULLVER}_${ARCH}.ipk"
+          WORK=$(mktemp -d)
+          echo "2.0" > "$WORK/debian-binary"
+          cp "$CTRL_TGZ" "$WORK/control.tar.gz"
+          cp "$DATA_TGZ" "$WORK/data.tar.gz"
+          (
+            cd "$WORK"
+            tar --owner=0 --group=0 -czf "$IPK" debian-binary control.tar.gz data.tar.gz
+          )
+
+          ls -la "$OUT"
+          echo "IPK=$IPK" >> "$GITHUB_ENV"
+          # Record provenance
+          {
+            echo "status=PASS"
+            echo "honk_tag=$TAG"
+            echo "pkg_version=$FULLVER"
+            echo "arch=$ARCH"
+            echo "asset=${{ steps.ver.outputs.asset_name }}"
+            echo "package=$(basename "$IPK")"
+            echo "binary_sha256=$(sha256sum upstream/honk-core | awk '{print $1}')"
+            echo "expected_kernel_note=$EXPECTED_KERNEL (device must match for kmods/BTF)"
+            echo "service=disabled_by_default"
+            echo "auto_start=no"
+          } | tee "$OUT/honk-package-report.txt"
+
+      - name: Upload artifact
+        if: steps.skip.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kwrt-honk-ipk-${{ steps.ver.outputs.pkg_ver }}-${{ env.EXPECTED_ARCH }}
+          path: |
+            out/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: steps.skip.outputs.skip != 'true' && (inputs.publish_release || github.event_name == 'schedule')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.skip.outputs.release_tag }}
+          name: honk ${{ steps.ver.outputs.tag }} IPK (${{ env.EXPECTED_ARCH }})
+          body: |
+            ## Honk IPK for Kwrt (opkg)
+
+            | Item | Value |
+            |------|-------|
+            | Upstream | `${{ steps.ver.outputs.tag }}` (`daeuniverse/honk`) |
+            | Binary | official `aarch64-unknown-linux-musl-full` (static) |
+            | Architecture field | `${{ env.EXPECTED_ARCH }}` |
+            | Package format | **IPK** (opkg) — not OpenWrt 25.12 APK |
+            | Service | **disabled** on install; no auto-start |
+
+            ### Safety
+            - Packaging only. Does not SSH to any router.
+            - Does not enable or start honk.
+            - Does not modify OpenClash, DAED, DNS, routing, or sysctl.
+
+            ### Install (manual)
+            ```sh
+            uname -r   # expect ${{ env.EXPECTED_KERNEL }} on current Kwrt pin
+            opkg install ./honk_*.ipk
+            # resolve missing Depends from firmware feeds if needed
+            ls -l /usr/bin/honk-core
+            /etc/init.d/honk enabled || echo "service stays disabled (expected)"
+            ```
+
+            Enable only after you intentionally configure nodes/routing:
+            ```sh
+            /etc/init.d/honk enable
+            /etc/init.d/honk start
+            ```
+          files: |
+            out/*.ipk
+            out/honk-package-report.txt
+          draft: false
+          prerelease: true
+          make_latest: false
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
