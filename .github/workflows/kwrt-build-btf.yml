@@ -28,9 +28,14 @@ on:
         description: "Expected CONFIG_TARGET_ARCH_PACKAGES"
         required: true
         default: "aarch64_cortex-a53"
+      publish_release:
+        description: "Publish verified IPK to GitHub Release after gates pass"
+        required: false
+        default: true
+        type: boolean
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build-btf:
@@ -581,6 +586,73 @@ jobs:
             btf-package-paths.txt
           if-no-files-found: error
           retention-days: 30
+
+      - name: Prepare release notes
+        if: success() && inputs.publish_release
+        id: rel
+        shell: bash
+        run: |
+          set -euo pipefail
+          IPK=$(ls out/vmlinux-btf_*.ipk | head -1)
+          BASE=$(basename "$IPK")
+          TAG="btf-${EXPECTED_KERNEL}-${EXPECTED_ARCH}"
+          # allow re-publish same tag (updates assets)
+          {
+            echo "## Detached BTF IPK for Kwrt"
+            echo
+            echo "| Item | Value |"
+            echo "|------|-------|"
+            echo "| Kernel (\`uname -r\`) | \`${EXPECTED_KERNEL}\` |"
+            echo "| Architecture | \`${EXPECTED_ARCH}\` |"
+            echo "| Board | \`mediatek/filogic\` |"
+            echo "| Build date pin | \`${BUILD_DATE}\` |"
+            echo "| Package | \`${BASE}\` |"
+            echo "| OpenWrt commit | \`${OPENWRT_COMMIT}\` |"
+            echo "| Kwrt commit | \`${KWRT_COMMIT}\` |"
+            echo
+            echo "Install on device:"
+            echo
+            echo '```sh'
+            echo "cd /tmp"
+            echo "wget -O vmlinux-btf.ipk \\"
+            echo "  https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${BASE}"
+            echo "opkg install ./vmlinux-btf.ipk"
+            echo "ls -l /usr/lib/debug/boot/"
+            echo '```'
+            echo
+            echo "Only install when \`uname -r\` is exactly \`${EXPECTED_KERNEL}\`."
+            if [ -f btf-compat-report.txt ]; then
+              echo
+              echo "### Compat report"
+              echo '```'
+              cat btf-compat-report.txt
+              echo '```'
+            fi
+          } > release-notes.md
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "ipk=${IPK}" >> "$GITHUB_OUTPUT"
+          echo "title=vmlinux-btf ${EXPECTED_KERNEL} (${EXPECTED_ARCH})" >> "$GITHUB_OUTPUT"
+          cat release-notes.md
+
+      - name: Publish GitHub Release
+        if: success() && inputs.publish_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.rel.outputs.tag }}
+          name: ${{ steps.rel.outputs.title }}
+          body_path: release-notes.md
+          files: |
+            out/*.ipk
+            out/vmlinux.btf
+            btf-compat-report.txt
+          draft: false
+          prerelease: false
+          make_latest: true
+          # Re-running the workflow refreshes assets on the same tag
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # Even if the gate step fails, keep any IPK already produced by the build step
       - name: Upload raw IPK (fallback if gate failed)
